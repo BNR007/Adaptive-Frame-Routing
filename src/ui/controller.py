@@ -54,6 +54,9 @@ class RuntimeConfiguration:
     show_performance_overlay: bool = True
     output_refinement: float = 0.0
     temporal_stabilization: bool = True
+    regional_transform: bool = False
+    regional_budget_ms: float = 16.0
+    regional_debug_overlay: bool = False
     model_path: Path = SRVGG_MODEL
     ai_scale: str = "2"
     ai_input_layout: str = "nchw"
@@ -70,6 +73,10 @@ class RuntimeConfiguration:
             raise ValueError("Output refinement must be between 0 and 0.25.")
         if not isinstance(self.temporal_stabilization, bool):
             raise ValueError("Temporal stabilization must be enabled or disabled.")
+        if not isinstance(self.regional_transform, bool):
+            raise ValueError("Regional transformation must be enabled or disabled.")
+        if self.regional_budget_ms <= 0.0:
+            raise ValueError("Regional deadline budget must be positive.")
         if self.hwnd <= 0:
             raise ValueError("Select an open target window.")
         if self.upscaling_mode not in ("off", "shader", "ai"):
@@ -143,6 +150,11 @@ class RuntimeConfiguration:
             draw_preview_overlay=self.show_performance_overlay,
             output_refinement=self.output_refinement,
             temporal_stabilization=self.temporal_stabilization,
+            regional_transform=self.regional_transform,
+            regional_budget_ms=(
+                self.regional_budget_ms if self.regional_transform else None
+            ),
+            regional_debug_overlay=self.regional_debug_overlay,
             queue_depth=self.queue_depth, frame_generation=self.frame_generation,
             generated_frames=self.generated_frames, warmup_seconds=self.warmup_seconds,
             rife_model=Path(self.rife_model_path),

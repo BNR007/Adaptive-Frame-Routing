@@ -14,6 +14,13 @@ import numpy as np
 import onnxruntime as ort
 
 from resource_validation import ResourceLease
+from regional_transform import (
+    RegionProvenance,
+    RegionalConfig,
+    RegionalResult,
+    RegionRoute,
+    RegionalTransformController,
+)
 
 
 SUPPORTED_INTERPOLATOR_LAYOUTS = ("nchw", "nhwc")
@@ -143,6 +150,8 @@ class RIFEInterpolator(FrameInterpolator):
         inference_width: int | None = None,
         inference_height: int | None = None,
         temporal_stabilization: bool = False,
+        regional_transform: bool = False,
+        regional_budget_ms: float | None = None,
         session_factory: SessionFactory | None = None,
     ) -> None:
         self.model_path = model_path
@@ -183,6 +192,25 @@ class RIFEInterpolator(FrameInterpolator):
         if not isinstance(temporal_stabilization, bool):
             raise TypeError("Temporal stabilization must be a boolean.")
         self.temporal_stabilization = temporal_stabilization
+        if not isinstance(regional_transform, bool):
+            raise TypeError("Regional transformation must be a boolean.")
+        if regional_budget_ms is not None and (
+            isinstance(regional_budget_ms, bool)
+            or not isinstance(regional_budget_ms, (int, float))
+            or not np.isfinite(regional_budget_ms)
+            or regional_budget_ms <= 0.0
+        ):
+            raise ValueError("Regional deadline budget must be positive when set.")
+        self.regional_transform = regional_transform
+        self.regional_budget_ms = (
+            None if regional_budget_ms is None else float(regional_budget_ms)
+        )
+        self.regional_controller = (
+            RegionalTransformController(RegionalConfig())
+            if regional_transform
+            else None
+        )
+        self.last_regional_result: RegionalResult | None = None
         self._input_alignment = 32
         self._session_factory = session_factory or ort.InferenceSession
         self._session: _InferenceSession | None = None
@@ -214,6 +242,8 @@ class RIFEInterpolator(FrameInterpolator):
         self._input_tensor_buffers: tuple[np.ndarray, np.ndarray] | None = None
         self._full_midpoint_buffer: np.ndarray | None = None
         self._full_fallback_buffer: np.ndarray | None = None
+        self._full_confidence_buffer: np.ndarray | None = None
+        self._full_stable_buffer: np.ndarray | None = None
         self._validation_session_lease = ResourceLease("onnx_sessions")
 
     @property
@@ -446,8 +476,10 @@ class RIFEInterpolator(FrameInterpolator):
         frame = np.zeros((height, width, 3), dtype=np.uint8)
         tensor = self._prepare_input(frame, padded_height, padded_width)
         started = time.perf_counter()
+        call_times_ms: list[float] = []
         try:
             for _ in range(iterations):
+                call_started = time.perf_counter()
                 outputs = self._session.run(
                     [self._output_name],
                     {
@@ -459,6 +491,7 @@ class RIFEInterpolator(FrameInterpolator):
                     raise RIFEInterpolatorError(
                         "RIFE ONNX warmup returned an unexpected output count."
                     )
+                call_times_ms.append((time.perf_counter() - call_started) * 1000.0)
         except RIFEInterpolatorError:
             raise
         except Exception as error:
@@ -466,6 +499,14 @@ class RIFEInterpolator(FrameInterpolator):
                 f"RIFE ONNX warmup inference failed: {error}"
             ) from error
         elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if self.regional_controller is not None and call_times_ms:
+            # Exclude graph compilation when possible, then add the measured
+            # fallback-path overhead conservatively. This prevents one visible
+            # live stall before the deadline controller learns that a model is
+            # already too expensive for the requested frame budget.
+            steady_times = call_times_ms[1:] or call_times_ms
+            predicted_transform_ms = float(np.median(steady_times)) + 12.0
+            self.regional_controller.record_inference_cost(predicted_transform_ms)
         logging.getLogger(__name__).info(
             "RIFE warmup: %s calls at %sx%s completed in %.2f ms",
             iterations,
@@ -582,13 +623,17 @@ class RIFEInterpolator(FrameInterpolator):
             frame_a,
             (resized_width, resized_height),
             dst=buffers[0],
-            interpolation=cv2.INTER_AREA,
+            interpolation=(
+                cv2.INTER_LINEAR if self.regional_transform else cv2.INTER_AREA
+            ),
         )
         cv2.resize(
             frame_b,
             (resized_width, resized_height),
             dst=buffers[1],
-            interpolation=cv2.INTER_AREA,
+            interpolation=(
+                cv2.INTER_LINEAR if self.regional_transform else cv2.INTER_AREA
+            ),
         )
         return buffers
 
@@ -781,6 +826,7 @@ class RIFEInterpolator(FrameInterpolator):
         self.last_stabilized_fraction = 0.0
         self.last_interpolation_confidence = 1.0
         self.last_duplicate_bypass = False
+        self.last_regional_result = None
         self._validate_frame_pair(frame_a, frame_b)
         total_start = time.perf_counter()
         original_height, original_width = frame_a.shape[:2]
@@ -788,7 +834,7 @@ class RIFEInterpolator(FrameInterpolator):
         inference_frame_a, inference_frame_b = self._resize_pair_for_inference(
             frame_a, frame_b
         )
-        if self.temporal_stabilization:
+        if self.temporal_stabilization and not self.regional_transform:
             # Reuse the already downscaled inference inputs for motion analysis.
             # An extra pair of full-resolution AREA resizes cost several ms per
             # frame pair at 720p and provided no additional useful signal.
@@ -837,54 +883,131 @@ class RIFEInterpolator(FrameInterpolator):
         inference_height, inference_width = inference_frame_a.shape[:2]
         padded_height = ((inference_height + self._input_alignment - 1) // self._input_alignment) * self._input_alignment
         padded_width = ((inference_width + self._input_alignment - 1) // self._input_alignment) * self._input_alignment
-        tensor_a, tensor_b = self._prepare_input_pair(
-            inference_frame_a,
-            inference_frame_b,
-            padded_height,
-            padded_width,
-        )
-        self._validate_runtime_shape(
-            tensor_a.shape,
-            self._input_shapes[0],
-            "RIFE input 1",
-        )
-        self._validate_runtime_shape(
-            tensor_b.shape,
-            self._input_shapes[1],
-            "RIFE input 2",
-        )
-        self.last_preprocessing_ms = (
-            time.perf_counter() - preprocessing_start
-        ) * 1000.0
-        try:
-            inference_start = time.perf_counter()
-            outputs = self._session.run(
-                [self._output_name],
-                {
-                    self._input_names[0]: tensor_a,
-                    self._input_names[1]: tensor_b,
-                },
+        regional_analysis = None
+        skip_regional_inference = False
+        regional_model_executed = False
+        if self.regional_transform:
+            if self.regional_controller is None:
+                raise RIFEInterpolatorError(
+                    "Regional transformation controller is unavailable."
+                )
+            regional_analysis = self.regional_controller.analyze(
+                inference_frame_a, inference_frame_b
             )
-            self.last_inference_ms = (
-                time.perf_counter() - inference_start
+            preselected = self.regional_controller.allocate(
+                regional_analysis,
+                self.regional_budget_ms,
+                elapsed_ms=regional_analysis.analysis_ms,
+            )
+            preselected &= regional_analysis.routes == RegionRoute.SMOOTH_MOTION
+            skip_regional_inference = not self.regional_controller.should_run_model(
+                regional_analysis,
+                preselected,
+                self.regional_budget_ms,
+                elapsed_ms=regional_analysis.analysis_ms,
+            )
+
+        if skip_regional_inference:
+            output = cv2.addWeighted(
+                inference_frame_a, 0.5, inference_frame_b, 0.5, 0.0
+            )
+            self.last_preprocessing_ms = (
+                time.perf_counter() - preprocessing_start
             ) * 1000.0
-        except Exception as error:
-            self.last_inference_ms = None
-            raise RIFEInterpolatorError(f"RIFE ONNX inference failed: {error}") from error
-        if len(outputs) != 1:
-            raise RIFEInterpolatorError(
-                f"RIFE ONNX inference returned {len(outputs)} outputs; expected one."
+            self.last_inference_ms = 0.0
+            self.last_duplicate_bypass = True
+        else:
+            tensor_a, tensor_b = self._prepare_input_pair(
+                inference_frame_a,
+                inference_frame_b,
+                padded_height,
+                padded_width,
+            )
+            self._validate_runtime_shape(
+                tensor_a.shape,
+                self._input_shapes[0],
+                "RIFE input 1",
+            )
+            self._validate_runtime_shape(
+                tensor_b.shape,
+                self._input_shapes[1],
+                "RIFE input 2",
+            )
+            self.last_preprocessing_ms = (
+                time.perf_counter() - preprocessing_start
+            ) * 1000.0
+            try:
+                inference_start = time.perf_counter()
+                outputs = self._session.run(
+                    [self._output_name],
+                    {
+                        self._input_names[0]: tensor_a,
+                        self._input_names[1]: tensor_b,
+                    },
+                )
+                self.last_inference_ms = (
+                    time.perf_counter() - inference_start
+                ) * 1000.0
+                regional_model_executed = self.regional_transform
+            except Exception as error:
+                self.last_inference_ms = None
+                raise RIFEInterpolatorError(
+                    f"RIFE ONNX inference failed: {error}"
+                ) from error
+            if len(outputs) != 1:
+                raise RIFEInterpolatorError(
+                    f"RIFE ONNX inference returned {len(outputs)} outputs; expected one."
+                )
+            output = self._prepare_output(
+                outputs[0],
+                inference_height,
+                inference_width,
+                padded_height,
+                padded_width,
             )
         postprocessing_start = time.perf_counter()
-        output = self._prepare_output(
-            outputs[0],
-            inference_height,
-            inference_width,
-            padded_height,
-            padded_width,
-        )
         fallback_mask = None
-        if self.temporal_stabilization:
+        regional_candidate = None
+        regional_confidence = None
+        regional_endpoint_fallback = None
+        regional_scene_cut = False
+        if self.regional_transform:
+            if self.regional_controller is None:
+                raise RIFEInterpolatorError(
+                    "Regional transformation controller is unavailable."
+                )
+            regional_candidate = output
+            if skip_regional_inference:
+                self.last_regional_result = self.regional_controller.compose_fallback(
+                    inference_frame_a,
+                    inference_frame_b,
+                    analysis=regional_analysis,
+                )
+            else:
+                self.last_regional_result = self.regional_controller.compose_interpolation(
+                    output,
+                    inference_frame_a,
+                    inference_frame_b,
+                    analysis=regional_analysis,
+                    budget_ms=self.regional_budget_ms,
+                )
+            output = self.last_regional_result.frame
+            regional_confidence = self.last_regional_result.pixel_confidence
+            regional_endpoint_fallback = (
+                self.last_regional_result.endpoint_fallback
+            )
+            regional_scene_cut = bool(
+                self.last_regional_result.provenance.size
+                and np.all(
+                    self.last_regional_result.provenance
+                    == RegionProvenance.REAL
+                )
+            )
+            self.last_stabilized_fraction = 1.0 - float(
+                np.mean(self.last_regional_result.confidence)
+            )
+            self.last_interpolation_confidence = 1.0 - self.last_stabilized_fraction
+        elif self.temporal_stabilization:
             # Stabilize at the model's working resolution. Doing this after
             # enlargement creates several full-size temporary images and can
             # add over 100 ms per generated frame at 720p.
@@ -897,7 +1020,99 @@ class RIFEInterpolator(FrameInterpolator):
             )
             self.last_interpolation_confidence = 1.0 - self.last_stabilized_fraction
         output_was_resized = output.shape[:2] != (original_height, original_width)
-        if output_was_resized:
+        if output_was_resized and regional_candidate is not None:
+            if regional_scene_cut:
+                output = frame_b.copy()
+            elif skip_regional_inference:
+                # When no neural pixels were admitted, construct the stable
+                # fallback directly at source resolution. Resizing and then
+                # reconstructing a low-resolution midpoint wasted 10-20 ms.
+                if (
+                    self._full_midpoint_buffer is None
+                    or self._full_midpoint_buffer.shape != frame_a.shape
+                ):
+                    self._full_midpoint_buffer = np.empty_like(frame_a)
+                output = cv2.addWeighted(
+                    frame_a,
+                    0.5,
+                    frame_b,
+                    0.5,
+                    0.0,
+                    dst=self._full_midpoint_buffer,
+                )
+                output = np.ascontiguousarray(output)
+                fallback_mask = None
+            else:
+                # The expensive confidence composition has already happened at
+                # inference resolution. Enlarge that result once, then restore
+                # exact endpoint detail only where confidence is effectively
+                # zero. This avoids several full-frame float RGB allocations.
+                output = cv2.resize(
+                    self.last_regional_result.frame,
+                    (original_width, original_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                if (
+                    self._full_midpoint_buffer is None
+                    or self._full_midpoint_buffer.shape != frame_a.shape
+                ):
+                    self._full_midpoint_buffer = np.empty_like(frame_a)
+                full_midpoint = cv2.addWeighted(
+                    frame_a,
+                    0.5,
+                    frame_b,
+                    0.5,
+                    0.0,
+                    dst=self._full_midpoint_buffer,
+                )
+                assert regional_confidence is not None
+                assert regional_endpoint_fallback is not None
+                if (
+                    self._full_confidence_buffer is None
+                    or self._full_confidence_buffer.shape != frame_a.shape[:2]
+                ):
+                    self._full_confidence_buffer = np.empty(
+                        frame_a.shape[:2], dtype=np.float32
+                    )
+                full_confidence = cv2.resize(
+                    regional_confidence,
+                    (original_width, original_height),
+                    dst=self._full_confidence_buffer,
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                if (
+                    self._full_fallback_buffer is None
+                    or self._full_fallback_buffer.shape != frame_a.shape[:2]
+                ):
+                    self._full_fallback_buffer = np.empty(
+                        frame_a.shape[:2], dtype=np.uint8
+                    )
+                endpoint_mask = cv2.resize(
+                    cv2.compare(
+                        regional_endpoint_fallback,
+                        0.5,
+                        cv2.CMP_GE,
+                    ),
+                    (original_width, original_height),
+                    dst=self._full_fallback_buffer,
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                if (
+                    self._full_stable_buffer is None
+                    or self._full_stable_buffer.shape != frame_a.shape
+                ):
+                    self._full_stable_buffer = np.empty_like(frame_a)
+                np.copyto(self._full_stable_buffer, full_midpoint)
+                cv2.copyTo(frame_b, endpoint_mask, self._full_stable_buffer)
+                fallback_mask = cv2.compare(
+                    full_confidence,
+                    self.regional_controller.config.confidence_floor,
+                    cv2.CMP_LE,
+                    dst=self._full_fallback_buffer,
+                )
+                cv2.copyTo(self._full_stable_buffer, fallback_mask, output)
+                output = np.ascontiguousarray(output)
+        elif output_was_resized:
             output = cv2.resize(
                 output,
                 (original_width, original_height),
@@ -941,6 +1156,8 @@ class RIFEInterpolator(FrameInterpolator):
             time.perf_counter() - postprocessing_start
         ) * 1000.0
         self.last_total_ms = (time.perf_counter() - total_start) * 1000.0
+        if regional_model_executed and self.regional_controller is not None:
+            self.regional_controller.record_inference_cost(self.last_total_ms)
         self._profile_samples.append((self.last_preprocessing_ms, self.last_inference_ms,
                                       self.last_postprocessing_ms, self.last_total_ms,
                                       self.last_interpolation_confidence))
@@ -984,4 +1201,9 @@ class RIFEInterpolator(FrameInterpolator):
         self._input_tensor_buffers = None
         self._full_midpoint_buffer = None
         self._full_fallback_buffer = None
+        self._full_confidence_buffer = None
+        self._full_stable_buffer = None
         self.last_duplicate_bypass = False
+        self.last_regional_result = None
+        if self.regional_controller is not None:
+            self.regional_controller.reset()

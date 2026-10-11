@@ -466,6 +466,24 @@ def test_temporal_stabilization_is_saved_and_reaches_runtime(qt_app, tmp_path):
     assert SettingsStore(tmp_path / "gui.json").load().temporal_stabilization is False
 
 
+def test_regional_transform_is_saved_and_reaches_runtime(qt_app, tmp_path):
+    window = make_window(qt_app, tmp_path)
+    window.frame_generation_control.set_value("rife")
+    window.regional_transform.setChecked(True)
+    window.regional_budget.setValue(12.5)
+    window.regional_debug_overlay.setChecked(True)
+    args = window._configuration().to_engine_args()
+    assert args.regional_transform is True
+    assert args.regional_budget_ms == pytest.approx(12.5)
+    assert args.regional_debug_overlay is True
+    window._save_settings()
+    loaded = SettingsStore(tmp_path / "gui.json").load()
+    assert loaded.regional_transform is True
+    assert loaded.regional_budget_ms == pytest.approx(12.5)
+    assert loaded.regional_debug_overlay is True
+    window.close()
+
+
 def test_rife_lite_selection_persists_and_reaches_runtime(qt_app,tmp_path):
     from ui.controller import RIFE_LITE_MODEL
     window=make_window(qt_app,tmp_path)

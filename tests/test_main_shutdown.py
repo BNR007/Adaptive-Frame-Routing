@@ -341,11 +341,22 @@ def test_live_rife_factory_uses_selected_provider_and_shuts_down(
     created = []
 
     class FakeRIFEInterpolator:
-        def __init__(self, model_path, *, provider, device_id, temporal_stabilization):
+        def __init__(
+            self,
+            model_path,
+            *,
+            provider,
+            device_id,
+            temporal_stabilization,
+            regional_transform,
+            regional_budget_ms,
+        ):
             self.model_path = model_path
             self.provider = provider
             self.device_id = device_id
             self.temporal_stabilization = temporal_stabilization
+            self.regional_transform = regional_transform
+            self.regional_budget_ms = regional_budget_ms
             self.initialized = False
             self.shutdown_calls = 0
             created.append(self)
@@ -370,6 +381,8 @@ def test_live_rife_factory_uses_selected_provider_and_shuts_down(
     assert interpolator.provider == "directml"
     assert interpolator.device_id == 0
     assert interpolator.temporal_stabilization is True
+    assert interpolator.regional_transform is False
+    assert interpolator.regional_budget_ms is None
     assert interpolator.initialized is True
     assert interpolator.shutdown_calls == 1
 

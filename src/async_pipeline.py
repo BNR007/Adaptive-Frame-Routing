@@ -49,6 +49,11 @@ class ProcessedFrame:
     frame_generation: str = "off"
     frame_kind: str = "processed"
     generation_position: float = 1.0
+    regional_provenance: Any | None = None
+    regional_confidence: Any | None = None
+    regional_route_counts: dict[str, int] | None = None
+    regional_provenance_counts: dict[str, int] | None = None
+    regional_admission_reason: str | None = None
 
     @property
     def frame_age_ms(self) -> float:
@@ -546,26 +551,43 @@ class AsyncFramePipeline:
         self,
         frame_a: Any,
         frame_b: Any,
-    ) -> list[tuple[float, Any]]:
+    ) -> list[tuple[float, Any, Any | None]]:
         """Generate one to four ordered frames with a midpoint-only interpolator."""
 
         interpolate = self._frame_interpolator.interpolate
-        midpoint = interpolate(frame_a, frame_b)
+        def generate(first, second):
+            image = interpolate(first, second)
+            return image, getattr(
+                self._frame_interpolator, "last_regional_result", None
+            )
+
+        midpoint, midpoint_regional = generate(frame_a, frame_b)
         if self.generated_frames == 1:
-            return [(0.5, midpoint)]
+            return [(0.5, midpoint, midpoint_regional)]
 
-        quarter = interpolate(frame_a, midpoint)
-        three_quarter = interpolate(midpoint, frame_b)
+        quarter, quarter_regional = generate(frame_a, midpoint)
+        three_quarter, three_quarter_regional = generate(midpoint, frame_b)
         if self.generated_frames == 2:
-            return [(0.25, quarter), (0.75, three_quarter)]
+            return [
+                (0.25, quarter, quarter_regional),
+                (0.75, three_quarter, three_quarter_regional),
+            ]
         if self.generated_frames == 3:
-            return [(0.25, quarter), (0.5, midpoint), (0.75, three_quarter)]
+            return [
+                (0.25, quarter, quarter_regional),
+                (0.5, midpoint, midpoint_regional),
+                (0.75, three_quarter, three_quarter_regional),
+            ]
 
+        one_eighth, one_eighth_regional = generate(frame_a, quarter)
+        three_eighths, three_eighths_regional = generate(quarter, midpoint)
+        five_eighths, five_eighths_regional = generate(midpoint, three_quarter)
+        seven_eighths, seven_eighths_regional = generate(three_quarter, frame_b)
         return [
-            (0.125, interpolate(frame_a, quarter)),
-            (0.375, interpolate(quarter, midpoint)),
-            (0.625, interpolate(midpoint, three_quarter)),
-            (0.875, interpolate(three_quarter, frame_b)),
+            (0.125, one_eighth, one_eighth_regional),
+            (0.375, three_eighths, three_eighths_regional),
+            (0.625, five_eighths, five_eighths_regional),
+            (0.875, seven_eighths, seven_eighths_regional),
         ]
 
     def _publish_results(self, results: list[ProcessedFrame]) -> None:
@@ -657,7 +679,7 @@ class AsyncFramePipeline:
                         False,
                     )
                 )
-                generated_images: list[tuple[float, Any]] = []
+                generated_images: list[tuple[float, Any, Any | None]] = []
                 interpolation_ms = None
                 if generates_middle_frame and self._previous_processed_image is not None:
                     try:
@@ -709,7 +731,7 @@ class AsyncFramePipeline:
                     **frame_generation_metadata,
                 )
                 results = []
-                for generation_position, generated_image in generated_images:
+                for generation_position, generated_image, regional_result in generated_images:
                     results.append(
                         ProcessedFrame(
                             sequence_id=captured.sequence_id,
@@ -722,6 +744,31 @@ class AsyncFramePipeline:
                             **frame_generation_metadata,
                             frame_kind="generated",
                             generation_position=generation_position,
+                            regional_provenance=(
+                                regional_result.provenance
+                                if regional_result is not None
+                                else None
+                            ),
+                            regional_confidence=(
+                                regional_result.confidence
+                                if regional_result is not None
+                                else None
+                            ),
+                            regional_route_counts=(
+                                regional_result.route_counts
+                                if regional_result is not None
+                                else None
+                            ),
+                            regional_provenance_counts=(
+                                regional_result.provenance_counts
+                                if regional_result is not None
+                                else None
+                            ),
+                            regional_admission_reason=(
+                                regional_result.admission_reason
+                                if regional_result is not None
+                                else None
+                            ),
                         )
                     )
                 results.append(current_result)

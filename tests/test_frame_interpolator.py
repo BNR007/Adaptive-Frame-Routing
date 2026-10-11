@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import time
 
 import cv2
 import numpy as np
@@ -515,6 +516,10 @@ def test_rife_rejects_invalid_layout_provider_and_device() -> None:
         RIFEInterpolator("model.onnx", inference_width=0, inference_height=180)
     with pytest.raises(TypeError, match="boolean"):
         RIFEInterpolator("model.onnx", temporal_stabilization="yes")
+    with pytest.raises(TypeError, match="boolean"):
+        RIFEInterpolator("model.onnx", regional_transform="yes")
+    with pytest.raises(ValueError, match="positive"):
+        RIFEInterpolator("model.onnx", regional_budget_ms=0.0)
 
 
 def test_static_detail_restoration_preserves_texture_without_touching_motion():
@@ -693,6 +698,139 @@ def test_temporal_stabilization_runs_before_full_resolution_resize(
         assert observed_shapes == [((16, 16, 3),) * 3]
     finally:
         r.shutdown()
+
+
+def test_regional_transform_runs_at_inference_resolution(tmp_path):
+    model = tmp_path / "rife.onnx"
+    model.touch()
+    interpolator = RIFEInterpolator(
+        model,
+        session_factory=_FakeSession,
+        inference_width=32,
+        inference_height=32,
+        regional_transform=True,
+    )
+    interpolator.initialize()
+    first = np.zeros((96, 128, 3), dtype=np.uint8)
+    second = first.copy()
+    cv2.rectangle(second, (48, 24), (88, 72), (180, 120, 80), -1)
+    try:
+        output = interpolator.interpolate(first, second)
+        assert output.shape == first.shape
+        assert interpolator.last_regional_result is not None
+        assert interpolator.last_regional_result.analysis_ms >= 0.0
+        assert interpolator.last_regional_result.provenance_counts
+        assert 0.0 <= interpolator.last_interpolation_confidence <= 1.0
+    finally:
+        interpolator.shutdown()
+
+
+def test_regional_full_resolution_fallback_restores_exact_static_detail(tmp_path):
+    model = tmp_path / "rife.onnx"
+    model.touch()
+    interpolator = RIFEInterpolator(
+        model,
+        session_factory=_FakeSession,
+        inference_width=16,
+        inference_height=16,
+        regional_transform=True,
+    )
+    interpolator.initialize()
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    frame[::2, ::2] = 255
+    try:
+        output = interpolator.interpolate(frame, frame.copy())
+        np.testing.assert_array_equal(output, frame)
+        assert interpolator.last_inference_ms == 0.0
+        assert interpolator._full_midpoint_buffer is not None
+    finally:
+        interpolator.shutdown()
+
+
+def test_regional_transform_skips_model_when_no_tile_is_temporally_eligible(
+    tmp_path,
+):
+    model = tmp_path / "rife.onnx"
+    model.touch()
+    sessions = []
+
+    class CountingSession(_FakeSession):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.run_calls = 0
+
+        def run(self, output_names, input_feed):
+            self.run_calls += 1
+            return super().run(output_names, input_feed)
+
+    def factory(*args, **kwargs):
+        session = CountingSession(*args, **kwargs)
+        sessions.append(session)
+        return session
+
+    interpolator = RIFEInterpolator(
+        model,
+        session_factory=factory,
+        inference_width=32,
+        inference_height=32,
+        regional_transform=True,
+    )
+    interpolator.initialize()
+    frame = np.zeros((96, 128, 3), dtype=np.uint8)
+    cv2.putText(frame, "HUD", (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,) * 3, 2)
+    try:
+        output = interpolator.interpolate(frame, frame.copy())
+        np.testing.assert_array_equal(output, frame)
+        assert sessions[0].run_calls == 0
+        assert interpolator.last_inference_ms == 0.0
+        assert interpolator.last_duplicate_bypass
+    finally:
+        interpolator.shutdown()
+
+
+def test_regional_transform_learns_model_cost_then_enforces_deadline(tmp_path):
+    model = tmp_path / "rife.onnx"
+    model.touch()
+    sessions = []
+
+    class SlowCountingSession(_FakeSession):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.run_calls = 0
+
+        def run(self, output_names, input_feed):
+            self.run_calls += 1
+            time.sleep(0.150)
+            return super().run(output_names, input_feed)
+
+    def factory(*args, **kwargs):
+        session = SlowCountingSession(*args, **kwargs)
+        sessions.append(session)
+        return session
+
+    interpolator = RIFEInterpolator(
+        model,
+        session_factory=factory,
+        inference_width=32,
+        inference_height=32,
+        regional_transform=True,
+        regional_budget_ms=100.0,
+    )
+    interpolator.initialize()
+    first = np.full((64, 64, 3), 20, dtype=np.uint8)
+    second = np.full_like(first, 25)
+    try:
+        interpolator.interpolate(first, second)
+        assert sessions[0].run_calls == 1
+        assert interpolator.regional_controller is not None
+        assert interpolator.regional_controller.predicted_inference_cost_ms >= 150.0
+
+        interpolator.interpolate(first, second)
+        assert sessions[0].run_calls == 1
+        assert interpolator.last_inference_ms == 0.0
+        assert interpolator.last_duplicate_bypass
+    finally:
+        interpolator.shutdown()
 
 
 def test_confidence_fallback_restores_full_resolution_static_texture(tmp_path):

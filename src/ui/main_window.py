@@ -465,6 +465,31 @@ class MainWindow(QMainWindow):
             "clear motion remains model-generated."
         )
         card.add_row(SettingsRow("Temporal stabilization", self.temporal_stabilization))
+        self.regional_transform = Switch()
+        self.regional_transform.setAccessibleName(
+            "Use experimental regional frame transformation"
+        )
+        self.regional_transform.setToolTip(
+            "Routes tiles by motion and reliability, blends uncertain generated "
+            "regions, and records provenance for research evaluation."
+        )
+        card.add_row(SettingsRow("Regional transformation", self.regional_transform))
+        self.regional_budget = QDoubleSpinBox()
+        self.regional_budget.setRange(1.0, 100.0)
+        self.regional_budget.setDecimals(1)
+        self.regional_budget.setSuffix(" ms")
+        self.regional_budget_row = SettingsRow(
+            "Regional deadline", self.regional_budget
+        )
+        card.add_row(self.regional_budget_row)
+        self.regional_debug_overlay = Switch()
+        self.regional_debug_overlay.setAccessibleName(
+            "Show regional provenance colours"
+        )
+        self.regional_debug_overlay_row = SettingsRow(
+            "Provenance view", self.regional_debug_overlay
+        )
+        card.add_row(self.regional_debug_overlay_row)
 
         self.pacing_combo = self._build_pacing_combo()
         card.add_row(SettingsRow("Frame pacing", self.pacing_combo))
@@ -613,6 +638,18 @@ class MainWindow(QMainWindow):
         self.temporal_stabilization.toggled.connect(
             lambda _checked: self._settings_changed()
         )
+        self.regional_transform.toggled.connect(
+            lambda _checked: self._settings_changed()
+        )
+        self.regional_transform.toggled.connect(
+            lambda _checked: self._update_visibility()
+        )
+        self.regional_budget.valueChanged.connect(
+            lambda _value: self._settings_changed()
+        )
+        self.regional_debug_overlay.toggled.connect(
+            lambda _checked: self._settings_changed()
+        )
         self.generated_frames_combo.currentIndexChanged.connect(
             lambda _index: self._settings_changed()
         )
@@ -714,6 +751,11 @@ class MainWindow(QMainWindow):
         self.overlay.setChecked(self.settings.show_performance_overlay)
         self._set_combo(self.output_refinement_combo, self.settings.output_refinement)
         self.temporal_stabilization.setChecked(self.settings.temporal_stabilization)
+        self.regional_transform.setChecked(self.settings.regional_transform)
+        self.regional_budget.setValue(self.settings.regional_budget_ms)
+        self.regional_debug_overlay.setChecked(
+            self.settings.regional_debug_overlay
+        )
         self.fsr_sharpening.setChecked(self.settings.fsr1_like_sharpening)
         self.fsr_sharpening_strength.setValue(self.settings.fsr1_like_sharpening_strength)
         self.fsr_edge_strength.setValue(self.settings.fsr1_like_edge_strength)
@@ -793,6 +835,11 @@ class MainWindow(QMainWindow):
         self.settings.show_performance_overlay = self.overlay.isChecked()
         self.settings.output_refinement = float(self.output_refinement_combo.currentData() or 0.0)
         self.settings.temporal_stabilization = self.temporal_stabilization.isChecked()
+        self.settings.regional_transform = self.regional_transform.isChecked()
+        self.settings.regional_budget_ms = self.regional_budget.value()
+        self.settings.regional_debug_overlay = (
+            self.regional_debug_overlay.isChecked()
+        )
         self.settings.ai_model_path = (
             self._custom_model_path if self.model_combo.currentData() == "custom" else ""
         )
@@ -1097,6 +1144,13 @@ class MainWindow(QMainWindow):
         self.rife_provider_row.setVisible(rife_enabled)
         self.rife_device_row.setVisible(rife_enabled)
         self.generated_frames_row.setVisible(rife_enabled)
+        self.regional_transform.setVisible(rife_enabled)
+        self.regional_budget_row.setVisible(
+            rife_enabled and self.regional_transform.isChecked()
+        )
+        self.regional_debug_overlay_row.setVisible(
+            rife_enabled and self.regional_transform.isChecked()
+        )
         self.device_id.setEnabled(self.provider_combo.currentData() == "directml")
         self.rife_device_id.setEnabled(self.rife_provider_combo.currentData() == "directml")
         fsr_enabled = (
@@ -1187,6 +1241,9 @@ class MainWindow(QMainWindow):
             output_refinement=(float(self.output_refinement_combo.currentData() or 0.0)
                                if self.pipeline_combo.currentData() == "cpu" else 0.0),
             temporal_stabilization=self.temporal_stabilization.isChecked(),
+            regional_transform=self.regional_transform.isChecked(),
+            regional_budget_ms=self.regional_budget.value(),
+            regional_debug_overlay=self.regional_debug_overlay.isChecked(),
             model_path=(
                 Path(self._custom_model_path)
                 if self.model_combo.currentData() == "custom"

@@ -66,6 +66,7 @@ from runtime_recovery import (
     RetryPolicy,
 )
 from resource_paths import resource_path
+from regional_transform import RegionalTransformController
 from wgc_capture import WGCError
 from window_capture import (
     WindowCaptureError,
@@ -212,6 +213,33 @@ def parse_args() -> argparse.Namespace:
         choices=(1, 2, 3, 4),
         default=1,
         help="Generate this many RIFE frames between consecutive real frames.",
+    )
+    parser.add_argument(
+        "--temporal-stabilization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the shipped whole-frame temporal stabilization heuristic.",
+    )
+    parser.add_argument(
+        "--regional-transform",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use experimental per-region routing, confidence composition, "
+            "deadline fallback, and provenance instead of the shipped heuristic."
+        ),
+    )
+    parser.add_argument(
+        "--regional-budget-ms",
+        type=_positive_float_argument,
+        default=None,
+        help="Optional regional work budget in milliseconds per generated frame.",
+    )
+    parser.add_argument(
+        "--regional-debug-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Colour generated-frame regions by their recorded provenance.",
     )
     parser.add_argument(
         "--rife-input-width",
@@ -670,6 +698,8 @@ def _create_frame_interpolator(
     inference_height: int | None = None,
     model_path: Path | None = None,
     temporal_stabilization: bool = True,
+    regional_transform: bool = False,
+    regional_budget_ms: float | None = None,
 ):
     """Create and initialize the selected optional interpolation hook."""
 
@@ -689,6 +719,8 @@ def _create_frame_interpolator(
             provider=provider,
             device_id=device_id,
             temporal_stabilization=temporal_stabilization,
+            regional_transform=regional_transform,
+            regional_budget_ms=regional_budget_ms,
             **inference_options,
         )
     else:
@@ -1102,6 +1134,8 @@ def run_application(
             inference_height=getattr(args, "rife_input_height", None),
             model_path=getattr(args, "rife_model", None),
             temporal_stabilization=getattr(args, "temporal_stabilization", True),
+            regional_transform=getattr(args, "regional_transform", False),
+            regional_budget_ms=getattr(args, "regional_budget_ms", None),
         )
 
     try:
@@ -1302,6 +1336,13 @@ def run_application(
                         )
                         if metrics.maybe_log(logger, now=presented_at):
                             logger.info("Preview refinement: previous sample %.2f ms", last_refinement_ms)
+                            if processed_frame.regional_provenance_counts:
+                                logger.info(
+                                    "Regional provenance: %s | routes: %s | admission: %s",
+                                    processed_frame.regional_provenance_counts,
+                                    processed_frame.regional_route_counts,
+                                    processed_frame.regional_admission_reason,
+                                )
                         telemetry_snapshot = metrics.snapshot()
                         if telemetry_callback is not None and telemetry_snapshot is not None:
                             telemetry_callback(telemetry_snapshot)
@@ -1312,6 +1353,13 @@ def run_application(
                     refinement_started = time.perf_counter()
                     frame = refine_output(frame, getattr(args, "output_refinement", 0.0))
                     last_refinement_ms = (time.perf_counter() - refinement_started) * 1000.0
+                    if (
+                        getattr(args, "regional_debug_overlay", False)
+                        and processed_frame.regional_provenance is not None
+                    ):
+                        frame = RegionalTransformController.provenance_overlay(
+                            frame, processed_frame.regional_provenance
+                        )
                     if getattr(args, "draw_preview_overlay", True):
                         _draw_preview_overlay(
                             frame,

@@ -38,6 +38,9 @@ class GuiSettings:
     show_performance_overlay: bool = True
     output_refinement: float = 0.0
     temporal_stabilization: bool = True
+    regional_transform: bool = False
+    regional_budget_ms: float = 16.0
+    regional_debug_overlay: bool = False
     ai_model_path: str = ""
     ai_scale: str = "2"
     ai_input_layout: str = "nchw"
