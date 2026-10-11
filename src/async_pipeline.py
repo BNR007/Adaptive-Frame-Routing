@@ -47,6 +47,7 @@ class ProcessedFrame:
     interpolation_ms: float | None = None
     interpolation_provider: str = "none"
     frame_generation: str = "off"
+    generation_method: str = "none"
     frame_kind: str = "processed"
     generation_position: float = 1.0
     regional_provenance: Any | None = None
@@ -527,6 +528,9 @@ class AsyncFramePipeline:
             "active_providers",
             (),
         )
+        generation_method = getattr(
+            self._frame_interpolator, "last_generation_method", "rife_midpoint"
+        )
         return {
             "interpolation_ms": getattr(
                 self._frame_interpolator,
@@ -534,7 +538,13 @@ class AsyncFramePipeline:
                 getattr(self._frame_interpolator, "last_inference_ms", None),
             ),
             "interpolation_provider": (
-                str(active_providers[0]) if active_providers else "none"
+                "OpenCV regional/flow CPU"
+                if generation_method in {
+                    "farneback_flow",
+                    "farneback_rejected",
+                    "regional_temporal_fallback",
+                }
+                else str(active_providers[0]) if active_providers else "none"
             ),
             "frame_generation": (
                 "rife"
@@ -545,6 +555,7 @@ class AsyncFramePipeline:
                 )
                 else "noop"
             ),
+            "generation_method": generation_method,
         }
 
     def _generate_intermediate_frames(
@@ -555,6 +566,22 @@ class AsyncFramePipeline:
         """Generate one to four ordered frames with a midpoint-only interpolator."""
 
         interpolate = self._frame_interpolator.interpolate
+
+        if self.generated_frames == 2:
+            interpolate_at = getattr(self._frame_interpolator, "interpolate_at", None)
+            if callable(interpolate_at):
+                generated = []
+                for position in (1.0 / 3.0, 2.0 / 3.0):
+                    image = interpolate_at(frame_a, frame_b, position)
+                    generated.append(
+                        (
+                            position,
+                            image,
+                            getattr(self._frame_interpolator, "last_regional_result", None),
+                        )
+                    )
+                return generated
+
         def generate(first, second):
             image = interpolate(first, second)
             return image, getattr(

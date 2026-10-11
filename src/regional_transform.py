@@ -40,6 +40,7 @@ class RegionProvenance(IntEnum):
     DEADLINE_FALLBACK = 5
     MIDPOINT_BLEND = 6
     ADMISSION_FALLBACK = 7
+    TEMPORAL_BLEND = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,10 +435,13 @@ class RegionalTransformController:
         *,
         analysis: RegionalAnalysis | None = None,
         budget_ms: float | None = None,
+        time_position: float = 0.5,
     ) -> RegionalResult:
         """Accept, blend, or reject an interpolation candidate per region."""
 
         self._validate_pair(frame_a, frame_b)
+        if not np.isfinite(time_position) or not 0.0 < time_position < 1.0:
+            raise ValueError("Interpolation time position must be between zero and one.")
         if generated.shape != frame_a.shape or generated.dtype != np.uint8:
             raise ValueError("Generated candidate must match the endpoint images.")
         analysis = analysis or self.analyze(frame_a, frame_b)
@@ -449,7 +453,10 @@ class RegionalTransformController:
         # temporal synthesis.  Only predictable motion may accept model pixels.
         selected &= analysis.routes == RegionRoute.SMOOTH_MOTION
         height, width = frame_a.shape[:2]
-        midpoint = cv2.addWeighted(frame_a, 0.5, frame_b, 0.5, 0.0)
+        temporal_blend = cv2.addWeighted(
+            frame_a, 1.0 - time_position, frame_b, time_position, 0.0
+        )
+        nearest_endpoint = frame_a if time_position < 0.5 else frame_b
         endpoint_tiles = np.isin(
             analysis.routes,
             (
@@ -471,12 +478,14 @@ class RegionalTransformController:
             np.float32
         )
         stable_fallback = np.rint(
-            frame_b.astype(np.float32) * endpoint_fallback[..., None]
-            + midpoint.astype(np.float32)
+            nearest_endpoint.astype(np.float32) * endpoint_fallback[..., None]
+            + temporal_blend.astype(np.float32)
             * (1.0 - endpoint_fallback[..., None])
         ).astype(np.uint8)
 
-        residual = cv2.cvtColor(cv2.absdiff(generated, midpoint), cv2.COLOR_BGR2GRAY)
+        residual = cv2.cvtColor(
+            cv2.absdiff(generated, temporal_blend), cv2.COLOR_BGR2GRAY
+        )
         residual_tiles = self._tile_means(
             residual,
             max(4, self.config.tile_size),
@@ -527,6 +536,8 @@ class RegionalTransformController:
         low_confidence = confidence_tiles <= self.config.confidence_floor
         provenance[low_confidence & ~endpoint_tiles] = (
             RegionProvenance.MIDPOINT_BLEND
+            if abs(time_position - 0.5) < 1e-9
+            else RegionProvenance.TEMPORAL_BLEND
         )
         provenance[low_confidence & endpoint_tiles] = RegionProvenance.REAL
         eligible = analysis.routes == RegionRoute.SMOOTH_MOTION
@@ -560,6 +571,7 @@ class RegionalTransformController:
         frame_b: np.ndarray,
         *,
         analysis: RegionalAnalysis,
+        time_position: float = 0.5,
     ) -> RegionalResult:
         """Build provenance for a rejected neural pass without candidate scoring."""
 
@@ -576,14 +588,24 @@ class RegionalTransformController:
             width,
             interpolation=cv2.INTER_NEAREST,
         )
-        midpoint = cv2.addWeighted(frame_a, 0.5, frame_b, 0.5, 0.0)
+        if not np.isfinite(time_position) or not 0.0 < time_position < 1.0:
+            raise ValueError("Interpolation time position must be between zero and one.")
+        midpoint = cv2.addWeighted(
+            frame_a, 1.0 - time_position, frame_b, time_position, 0.0
+        )
         endpoint_mask = cv2.compare(endpoint_fallback, 0.5, cv2.CMP_GE)
         cv2.copyTo(frame_b, endpoint_mask, midpoint)
         confidence_tiles = np.zeros(analysis.grid_shape, dtype=np.float32)
         pixel_confidence = np.zeros((height, width), dtype=np.float32)
         selected = np.zeros(analysis.grid_shape, dtype=bool)
         provenance = np.full(
-            analysis.grid_shape, RegionProvenance.MIDPOINT_BLEND, dtype=np.uint8
+            analysis.grid_shape,
+            (
+                RegionProvenance.MIDPOINT_BLEND
+                if abs(time_position - 0.5) < 1e-9
+                else RegionProvenance.TEMPORAL_BLEND
+            ),
+            dtype=np.uint8,
         )
         eligible = analysis.routes == RegionRoute.SMOOTH_MOTION
         provenance[eligible] = (
@@ -685,6 +707,7 @@ class RegionalTransformController:
                 (48, 48, 255),    # deadline fallback: red
                 (128, 180, 255),  # midpoint blend: pale orange
                 (180, 96, 255),   # admission fallback: pink
+                (96, 220, 255),   # non-midpoint temporal blend: amber
             ],
             dtype=np.uint8,
         )

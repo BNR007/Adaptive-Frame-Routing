@@ -63,6 +63,36 @@ rounding and still showed midpoint motion doubling on fast foreground objects.
 These results validate a stable fallback, not improved interpolation or display
 scanout. A live capture/presentation test is still required.
 
+## Two insertions per source interval
+
+`benchmarks/evaluate_two_insertions.py` evaluates equally spaced insertions at
+1/3 and 2/3 between real frames. The checked-in RIFE exports accept only two
+endpoint images and cannot take a timestep, so they cannot directly produce
+these two positions. The prototype uses bidirectional OpenCV Farneback flow
+with the regional confidence gate; uncertain tiles fall back to a temporal
+blend or the nearer real endpoint. It reports which route each insertion took,
+latency, exact image hashes, and PSNR/SSIM against withheld frames. A hash only
+proves the generated arrays are not byte-identical; it does not establish that
+all pixels contain correct motion or that a display actually scanned them out.
+
+On the 240-pair Subnautica: Below Zero clip run (59.87 fps source, sampled as
+19.96 source intervals/s), 480 insertions were produced and all 480 differed
+within their pairs. The regional flow path was used for 43.96% of inserts and
+the stable fallback for 56.04%. Mean generated latency was 33.33 ms (p95
+79.79 ms); mean pair latency was 66.69 ms (p95 152.36 ms). Maintaining the
+sampled source cadence requires finishing each pair within 50.11 ms; only
+56.1% of measured pairs met that deadline. The estimated serial output rate
+was 44.98 frames/s, so this prototype did not demonstrate stable 60 fps.
+
+Against withheld frames, mean PSNR was 34.44/33.98 dB at 1/3 and 2/3,
+compared with 34.35/34.07 dB for a plain temporal blend. Mean SSIM was
+0.9779/0.9757 compared with 0.9814/0.9796 for the blend. The small, mixed
+differences do not establish a general quality improvement. This test is a
+single lossy gameplay clip, and its offline rate does not measure interactive
+presentation, unique scanout, or input latency. The machine-local JSON and CSV
+results are retained under `output/two_insertions_subnautica_final/`; do not
+compare runs taken under different system load as a controlled ablation.
+
 This experiment measures offline reconstruction quality and processing time.
 It does not measure display scanout, distinct displayed frames, or
 input-to-photon latency, and its results must not be described as proof of

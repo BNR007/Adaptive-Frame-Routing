@@ -228,6 +228,8 @@ class RIFEInterpolator(FrameInterpolator):
         self.last_inference_ms: float | None = None
         self.last_postprocessing_ms: float | None = None
         self.last_total_ms: float | None = None
+        self.last_flow_ms: float = 0.0
+        self.last_generation_method = "rife_midpoint"
         self.input_dimensions: tuple[int, int] | None = None
         self.padded_input_dimensions: tuple[int, int] | None = None
         self.output_dimensions: tuple[int, int] | None = None
@@ -244,6 +246,8 @@ class RIFEInterpolator(FrameInterpolator):
         self._full_fallback_buffer: np.ndarray | None = None
         self._full_confidence_buffer: np.ndarray | None = None
         self._full_stable_buffer: np.ndarray | None = None
+        self._flow_cache_key: tuple[int, int, tuple[int, ...], tuple[int, ...]] | None = None
+        self._flow_cache: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
         self._validation_session_lease = ResourceLease("onnx_sessions")
 
     @property
@@ -808,6 +812,249 @@ class RIFEInterpolator(FrameInterpolator):
         cv2.copyTo(frame_b, stable, output)
         return output
 
+    def _fractional_flow_pair(
+        self,
+        frame_a: np.ndarray,
+        frame_b: np.ndarray,
+        *,
+        inference_pair: tuple[np.ndarray, np.ndarray] | None = None,
+    ):
+        """Compute a low-resolution bidirectional flow pair once per endpoint pair."""
+        key = (id(frame_a), id(frame_b), frame_a.shape, frame_b.shape)
+        if key == self._flow_cache_key and self._flow_cache is not None:
+            return self._flow_cache, 0.0
+        first, second = (
+            inference_pair
+            if inference_pair is not None
+            else self._resize_pair_for_inference(frame_a, frame_b)
+        )
+        gray_first = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
+        gray_second = cv2.cvtColor(second, cv2.COLOR_BGR2GRAY)
+        started = time.perf_counter()
+        flow_forward = cv2.calcOpticalFlowFarneback(
+            gray_first, gray_second, None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+        flow_backward = cv2.calcOpticalFlowFarneback(
+            gray_second, gray_first, None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._flow_cache_key = key
+        self._flow_cache = (first, second, flow_forward, flow_backward)
+        return self._flow_cache, elapsed_ms
+
+    def interpolate_at(self, frame_a: Any, frame_b: Any, time_position: float) -> Any:
+        """Synthesize a frame at a fractional time between real endpoints.
+
+        The checked-in RIFE ONNX exports have no timestep input and can only
+        infer the midpoint. For non-midpoint positions, use bidirectional
+        Farneback flow at the configured inference resolution. This keeps the
+        temporal locations real and reports flow work separately from neural
+        inference.
+        """
+        if isinstance(time_position, bool) or not isinstance(time_position, (int, float)):
+            raise TypeError("Interpolation time position must be numeric.")
+        position = float(time_position)
+        if not np.isfinite(position) or not 0.0 < position < 1.0:
+            raise ValueError("Interpolation time position must be between zero and one.")
+        if abs(position - 0.5) < 1e-9:
+            self.last_generation_method = "rife_midpoint"
+            return self.interpolate(frame_a, frame_b)
+        if self._session is None:
+            raise RIFEInterpolatorError("RIFEInterpolator is not initialized.")
+        self._validate_frame_pair(frame_a, frame_b)
+        total_started = time.perf_counter()
+        preprocess_started = time.perf_counter()
+        first, second = self._resize_pair_for_inference(frame_a, frame_b)
+        self.last_preprocessing_ms = (time.perf_counter() - preprocess_started) * 1000.0
+        self.last_inference_ms = 0.0
+        self.last_duplicate_bypass = False
+        self.last_regional_result = None
+        analysis = None
+        if self.regional_transform and self.regional_controller is not None:
+            analysis = self.regional_controller.analyze(first, second)
+            selected = self.regional_controller.allocate(
+                analysis,
+                self.regional_budget_ms,
+                elapsed_ms=analysis.analysis_ms,
+            )
+            if not np.any(selected):
+                self.regional_controller.last_admission_reason = "no_eligible_tiles"
+                self.last_regional_result = self.regional_controller.compose_fallback(
+                    first, second, analysis=analysis, time_position=position
+                )
+                self.last_generation_method = "regional_temporal_fallback"
+                self.last_flow_ms = 0.0
+                self.last_inference_ms = 0.0
+                self.last_interpolation_confidence = 0.0
+                self.last_stabilized_fraction = 1.0
+                fallback_started = time.perf_counter()
+                output = cv2.addWeighted(
+                    frame_a, 1.0 - position, frame_b, position, 0.0
+                )
+                endpoint_mask = cv2.resize(
+                    self.last_regional_result.endpoint_fallback,
+                    frame_a.shape[1::-1],
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                nearest_endpoint = frame_a if position < 0.5 else frame_b
+                cv2.copyTo(nearest_endpoint, cv2.compare(endpoint_mask, 0.5, cv2.CMP_GE), output)
+                self.last_postprocessing_ms = (
+                    time.perf_counter() - fallback_started
+                ) * 1000.0
+                self.last_total_ms = (time.perf_counter() - total_started) * 1000.0
+                self.input_dimensions = (first.shape[1], first.shape[0])
+                self.padded_input_dimensions = self.input_dimensions
+                self.output_dimensions = (output.shape[1], output.shape[0])
+                return np.ascontiguousarray(output)
+
+        (first, second, flow_forward, flow_backward), flow_ms = self._fractional_flow_pair(
+            frame_a, frame_b, inference_pair=(first, second)
+        )
+        self.last_preprocessing_ms = max(
+            0.0, (time.perf_counter() - preprocess_started) * 1000.0 - flow_ms
+        )
+        self.last_flow_ms = flow_ms
+        self.last_generation_method = "farneback_flow"
+        height, width = first.shape[:2]
+        x, y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+        map_first_x = x - position * flow_forward[..., 0]
+        map_first_y = y - position * flow_forward[..., 1]
+        map_second_x = x - (1.0 - position) * flow_backward[..., 0]
+        map_second_y = y - (1.0 - position) * flow_backward[..., 1]
+        if self.regional_transform and self.regional_controller is not None:
+            warped_first_small = cv2.remap(
+                first, map_first_x, map_first_y, cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            warped_second_small = cv2.remap(
+                second, map_second_x, map_second_y, cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+            candidate_small = cv2.addWeighted(
+                warped_first_small, 1.0 - position,
+                warped_second_small, position, 0.0,
+            )
+            self.last_regional_result = self.regional_controller.compose_interpolation(
+                candidate_small,
+                first,
+                second,
+                analysis=analysis,
+                budget_ms=self.regional_budget_ms,
+                time_position=position,
+            )
+            regional_result = self.last_regional_result
+            self.last_interpolation_confidence = float(
+                np.mean(regional_result.confidence)
+            )
+            self.last_stabilized_fraction = 1.0 - self.last_interpolation_confidence
+            if not np.any(regional_result.pixel_confidence > 0.0):
+                # Avoid full-resolution flow remapping and float-image blending
+                # when the confidence gate rejects every generated pixel.
+                self.last_generation_method = "farneback_rejected"
+                fallback_started = time.perf_counter()
+                output = cv2.addWeighted(
+                    frame_a, 1.0 - position, frame_b, position, 0.0
+                )
+                endpoint_mask = cv2.resize(
+                    regional_result.endpoint_fallback,
+                    frame_a.shape[1::-1],
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                nearest_endpoint = frame_a if position < 0.5 else frame_b
+                cv2.copyTo(
+                    nearest_endpoint,
+                    cv2.compare(endpoint_mask, 0.5, cv2.CMP_GE),
+                    output,
+                )
+                self.last_postprocessing_ms = (
+                    time.perf_counter() - fallback_started
+                ) * 1000.0
+                self.last_total_ms = (time.perf_counter() - total_started) * 1000.0
+                self.input_dimensions = (first.shape[1], first.shape[0])
+                self.padded_input_dimensions = self.input_dimensions
+                self.output_dimensions = (output.shape[1], output.shape[0])
+                return np.ascontiguousarray(output)
+        full_height, full_width = frame_a.shape[:2]
+        if (full_width, full_height) != (width, height):
+            flow_forward = cv2.resize(
+                flow_forward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+            )
+            flow_backward = cv2.resize(
+                flow_backward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+            )
+            flow_forward[..., 0] *= full_width / width
+            flow_forward[..., 1] *= full_height / height
+            flow_backward[..., 0] *= full_width / width
+            flow_backward[..., 1] *= full_height / height
+            height, width = full_height, full_width
+            x, y = np.meshgrid(
+                np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
+            )
+            map_first_x = x - position * flow_forward[..., 0]
+            map_first_y = y - position * flow_forward[..., 1]
+            map_second_x = x - (1.0 - position) * flow_backward[..., 0]
+            map_second_y = y - (1.0 - position) * flow_backward[..., 1]
+        warped_first = cv2.remap(
+            frame_a, map_first_x, map_first_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        warped_second = cv2.remap(
+            frame_b, map_second_x, map_second_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        candidate = cv2.addWeighted(
+            warped_first, 1.0 - position, warped_second, position, 0.0
+        )
+        post_started = time.perf_counter()
+        if self.regional_transform and self.regional_controller is not None:
+            regional_result = self.last_regional_result
+            assert regional_result is not None
+            if regional_result.frame.shape[:2] != frame_a.shape[:2]:
+                confidence = cv2.resize(
+                    regional_result.pixel_confidence,
+                    (frame_a.shape[1], frame_a.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )[..., None]
+                endpoint_fallback = cv2.resize(
+                    regional_result.endpoint_fallback,
+                    (frame_a.shape[1], frame_a.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                temporal_blend = cv2.addWeighted(
+                    frame_a, 1.0 - position, frame_b, position, 0.0
+                )
+                nearest_endpoint = frame_a if position < 0.5 else frame_b
+                stable_fallback = cv2.blendLinear(
+                    temporal_blend,
+                    nearest_endpoint,
+                    (1.0 - endpoint_fallback).astype(np.float32),
+                    endpoint_fallback.astype(np.float32),
+                )
+                confidence = confidence[..., 0].astype(np.float32)
+                candidate = cv2.blendLinear(
+                    stable_fallback,
+                    candidate,
+                    (1.0 - confidence).astype(np.float32),
+                    confidence,
+                )
+            else:
+                candidate = regional_result.frame
+            self.last_interpolation_confidence = float(
+                np.mean(regional_result.confidence)
+            )
+            self.last_stabilized_fraction = 1.0 - self.last_interpolation_confidence
+        else:
+            self.last_interpolation_confidence = 0.0
+            self.last_stabilized_fraction = 1.0
+        candidate = self._restore_static_detail(candidate, frame_a, frame_b)
+        self.last_preprocessing_ms = max(0.0, self.last_preprocessing_ms or 0.0)
+        self.last_postprocessing_ms = (time.perf_counter() - post_started) * 1000.0
+        self.last_total_ms = (time.perf_counter() - total_started) * 1000.0
+        self.input_dimensions = (first.shape[1], first.shape[0])
+        self.padded_input_dimensions = (first.shape[1], first.shape[0])
+        self.output_dimensions = (candidate.shape[1], candidate.shape[0])
+        return np.ascontiguousarray(candidate)
+
     def interpolate(self, frame_a: Any, frame_b: Any) -> Any:
         if (
             self._session is None
@@ -820,6 +1067,8 @@ class RIFEInterpolator(FrameInterpolator):
         self.last_inference_ms = None
         self.last_postprocessing_ms = None
         self.last_total_ms = None
+        self.last_flow_ms = 0.0
+        self.last_generation_method = "rife_midpoint"
         self.input_dimensions = None
         self.padded_input_dimensions = None
         self.output_dimensions = None
@@ -1192,6 +1441,8 @@ class RIFEInterpolator(FrameInterpolator):
         self.last_inference_ms = None
         self.last_postprocessing_ms = None
         self.last_total_ms = None
+        self.last_flow_ms = 0.0
+        self.last_generation_method = "rife_midpoint"
         self.input_dimensions = None
         self.padded_input_dimensions = None
         self.output_dimensions = None
@@ -1205,5 +1456,7 @@ class RIFEInterpolator(FrameInterpolator):
         self._full_stable_buffer = None
         self.last_duplicate_bypass = False
         self.last_regional_result = None
+        self._flow_cache_key = None
+        self._flow_cache = None
         if self.regional_controller is not None:
             self.regional_controller.reset()

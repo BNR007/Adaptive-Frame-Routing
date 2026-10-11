@@ -833,6 +833,39 @@ def test_regional_transform_learns_model_cost_then_enforces_deadline(tmp_path):
         interpolator.shutdown()
 
 
+def test_fractional_rife_api_uses_bidirectional_flow_and_reuses_pair(tmp_path):
+    model = tmp_path / "rife.onnx"
+    model.touch()
+    interpolator = RIFEInterpolator(
+        model,
+        session_factory=_FakeSession,
+        inference_width=96,
+        inference_height=64,
+        temporal_stabilization=False,
+    )
+    interpolator.initialize()
+    y, x = np.indices((128, 192))
+    first = np.zeros((128, 192, 3), dtype=np.uint8)
+    first[..., 0] = ((x * 13 + y * 3) % 255).astype(np.uint8)
+    first[..., 1] = ((x * 5 + y * 11) % 255).astype(np.uint8)
+    first[..., 2] = ((x * 7 + y * 17) % 255).astype(np.uint8)
+    matrix = np.float32([[1, 0, 3], [0, 1, 0]])
+    second = cv2.warpAffine(first, matrix, (first.shape[1], first.shape[0]))
+    try:
+        at_one_third = interpolator.interpolate_at(first, second, 1.0 / 3.0)
+        first_flow_ms = interpolator.last_flow_ms
+        at_two_thirds = interpolator.interpolate_at(first, second, 2.0 / 3.0)
+        assert at_one_third.shape == first.shape
+        assert at_two_thirds.shape == first.shape
+        assert interpolator.last_generation_method == "farneback_flow"
+        assert interpolator.last_inference_ms == 0.0
+        assert first_flow_ms > 0.0
+        assert interpolator.last_flow_ms == 0.0
+        assert not np.array_equal(at_one_third, at_two_thirds)
+    finally:
+        interpolator.shutdown()
+
+
 def test_confidence_fallback_restores_full_resolution_static_texture(tmp_path):
     model = tmp_path / "rife.onnx"
     model.touch()

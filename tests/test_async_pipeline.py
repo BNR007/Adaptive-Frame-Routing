@@ -397,6 +397,47 @@ def test_rife_generation_amount_publishes_requested_ordered_batch(
         pipeline.stop()
 
 
+def test_two_generated_frames_use_uniform_third_and_two_third_positions():
+    class FractionalInterpolator(_MidpointInterpolator):
+        last_generation_method = "farneback_flow"
+
+        def __init__(self):
+            super().__init__()
+            self.positions = []
+
+        def interpolate_at(self, frame_a, frame_b, position):
+            self.positions.append(position)
+            return f"at({position:.6f})"
+
+    interpolator = FractionalInterpolator()
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(), frame_interpolator=interpolator, generated_frames=2
+    )
+    pipeline.start()
+    try:
+        pipeline.submit("A")
+        assert pipeline.take_latest(timeout=1.0).image == "A"
+        pipeline.submit("B")
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert [item.generation_position for item in batch[:-1]] == pytest.approx(
+            [1.0 / 3.0, 2.0 / 3.0]
+        )
+        assert [item.image for item in batch[:-1]] == [
+            "at(0.333333)",
+            "at(0.666667)",
+        ]
+        assert interpolator.positions == pytest.approx([1.0 / 3.0, 2.0 / 3.0])
+        assert batch[0].interpolation_provider == "OpenCV regional/flow CPU"
+        assert batch[0].generation_method == "farneback_flow"
+    finally:
+        pipeline.stop()
+
+
 @pytest.mark.parametrize("generated_frames", (0, 5))
 def test_rife_generation_amount_rejects_out_of_range_values(generated_frames: int) -> None:
     with pytest.raises(ValueError, match="between 1 and 4"):

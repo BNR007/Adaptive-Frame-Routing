@@ -155,6 +155,26 @@ def test_confidence_composition_rejects_bad_generated_region() -> None:
     assert result.endpoint_fallback.shape == first.shape[:2]
 
 
+def test_fractional_fallback_blends_at_requested_temporal_position():
+    first = np.zeros((64, 96, 3), dtype=np.uint8)
+    second = np.full_like(first, 30)
+    controller = RegionalTransformController(
+        RegionalConfig(tile_size=16, analysis_scale=1, text_threshold=1.0)
+    )
+    analysis = controller.analyze(first, second)
+    analysis.routes.fill(RegionRoute.STATIC_DETAIL)
+    analysis.confidence.fill(0.0)
+    result = controller.compose_interpolation(
+        np.full_like(first, 255),
+        first,
+        second,
+        analysis=analysis,
+        time_position=1.0 / 3.0,
+    )
+    assert float(result.frame.mean()) == pytest.approx(10.0, abs=1.0)
+    assert result.provenance_counts.get("temporal_blend", 0) > 0
+
+
 def test_scene_cut_returns_real_endpoint() -> None:
     first = np.zeros((96, 128, 3), dtype=np.uint8)
     second = np.full_like(first, 255)
