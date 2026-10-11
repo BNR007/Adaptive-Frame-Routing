@@ -694,6 +694,7 @@ def _create_frame_interpolator(
     *,
     provider: str,
     device_id: int,
+    generated_frames: int = 1,
     inference_width: int | None = None,
     inference_height: int | None = None,
     model_path: Path | None = None,
@@ -708,6 +709,11 @@ def _create_frame_interpolator(
     if mode == "noop":
         interpolator = NoOpInterpolator()
     elif mode == "rife":
+        # Two evenly-spaced insertions use the CPU regional/optical-flow path
+        # at 1/3 and 2/3. The checked-in two-input RIFE exports cannot accept a
+        # timestep, so requiring DirectML here is both misleading and can stop
+        # a valid 2x run when DirectML is unavailable or silently falls back.
+        effective_provider = "cpu" if generated_frames == 2 else provider
         inference_options = {}
         if inference_width is not None or inference_height is not None:
             inference_options = {
@@ -716,7 +722,7 @@ def _create_frame_interpolator(
             }
         interpolator = RIFEInterpolator(
             model_path or DEFAULT_RIFE_MODEL_PATH,
-            provider=provider,
+            provider=effective_provider,
             device_id=device_id,
             temporal_stabilization=temporal_stabilization,
             regional_transform=regional_transform,
@@ -1133,6 +1139,7 @@ def run_application(
             inference_width=getattr(args, "rife_input_width", None),
             inference_height=getattr(args, "rife_input_height", None),
             model_path=getattr(args, "rife_model", None),
+            generated_frames=getattr(args, "generated_frames", 1),
             temporal_stabilization=getattr(args, "temporal_stabilization", True),
             regional_transform=getattr(args, "regional_transform", False),
             regional_budget_ms=getattr(args, "regional_budget_ms", None),
@@ -1184,7 +1191,12 @@ def run_application(
         )
     if frame_interpolator is not None:
         logger.info("Selected RIFE model: %s", getattr(args, "rife_model", None) or DEFAULT_RIFE_MODEL_PATH)
-        if getattr(args, "ai_provider", "cpu") == "directml":
+        if getattr(args, "generated_frames", 1) == 2:
+            logger.info(
+                "Two-insertion mode: CPU regional/flow generation at 1/3 and 2/3; "
+                "the selected neural provider is not used for these insertions."
+            )
+        elif getattr(args, "ai_provider", "cpu") == "directml":
             logger.info(
                 "Requested frame-generation DirectML device: %s",
                 getattr(args, "rife_device_id", None)

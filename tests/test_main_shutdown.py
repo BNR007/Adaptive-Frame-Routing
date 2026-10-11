@@ -387,6 +387,40 @@ def test_live_rife_factory_uses_selected_provider_and_shuts_down(
     assert interpolator.shutdown_calls == 1
 
 
+def test_two_insertions_use_cpu_flow_provider_even_when_directml_is_selected(
+    monkeypatch,
+) -> None:
+    created = []
+
+    class FakeRIFEInterpolator:
+        def __init__(self, model_path, **options):
+            self.model_path = model_path
+            self.options = options
+            self.initialized = False
+            created.append(self)
+
+        def initialize(self):
+            self.initialized = True
+
+    monkeypatch.setattr(main, "RIFEInterpolator", FakeRIFEInterpolator)
+
+    interpolator = main._create_frame_interpolator(
+        "rife",
+        provider="directml",
+        device_id=1,
+        generated_frames=2,
+        regional_transform=True,
+        inference_width=160,
+        inference_height=90,
+    )
+
+    assert created == [interpolator]
+    assert interpolator.options["provider"] == "cpu"
+    assert interpolator.options["device_id"] == 1
+    assert interpolator.options["regional_transform"] is True
+    assert interpolator.initialized is True
+
+
 def test_preview_overlay_starts_with_zero_fps(monkeypatch) -> None:
     lines = []
     monkeypatch.setattr(

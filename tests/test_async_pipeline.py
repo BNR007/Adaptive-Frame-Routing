@@ -438,6 +438,54 @@ def test_two_generated_frames_use_uniform_third_and_two_third_positions():
         pipeline.stop()
 
 
+def test_two_frame_deadline_miss_degrades_to_stable_midpoint():
+    class SlowFractionalInterpolator(_MidpointInterpolator):
+        last_generation_method = "farneback_flow"
+        regional_budget_ms = 16.0
+
+        def __init__(self):
+            super().__init__()
+            self.fractional_calls = 0
+            self.midpoint_calls = 0
+
+        def interpolate_at(self, frame_a, frame_b, position):
+            self.fractional_calls += 1
+            time.sleep(0.025)
+            return f"fractional({position:.3f})"
+
+        def interpolate(self, frame_a, frame_b):
+            self.midpoint_calls += 1
+            return f"midpoint({frame_a},{frame_b})"
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    interpolator = SlowFractionalInterpolator()
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(), frame_interpolator=interpolator, generated_frames=2
+    )
+    pipeline.start()
+    try:
+        pipeline.submit("A")
+        assert pipeline.take_latest(timeout=1.0).image == "A"
+
+        pipeline.submit("B")
+        first_batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert len(first_batch) == 3
+        assert interpolator.fractional_calls == 2
+
+        pipeline.submit("C")
+        degraded_batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert len(degraded_batch) == 2
+        assert degraded_batch[0].generation_position == pytest.approx(0.5)
+        assert degraded_batch[0].generation_method == "deadline_degraded_midpoint"
+        assert interpolator.fractional_calls == 2
+        assert interpolator.midpoint_calls == 1
+    finally:
+        pipeline.stop()
+
+
 @pytest.mark.parametrize("generated_frames", (0, 5))
 def test_rife_generation_amount_rejects_out_of_range_values(generated_frames: int) -> None:
     with pytest.raises(ValueError, match="between 1 and 4"):

@@ -214,6 +214,12 @@ class AsyncFramePipeline:
         self._dropped_generated_frames = 0
         self._interpolated_frames = 0
         self._interpolation_failures = 0
+        # Fractional 1/3 + 2/3 generation is allowed to prove that it fits the
+        # live deadline once.  If it does not, preserve the known-good midpoint
+        # path for the rest of the session instead of repeatedly starving
+        # capture and publishing an already-stale three-frame batch.
+        self._two_frame_pair_cost_ms: float | None = None
+        self._two_frame_deadline_missed = False
         self._started = False
         self._stopped = False
         self._capture_finished = capture_source is None
@@ -543,6 +549,7 @@ class AsyncFramePipeline:
                     "farneback_flow",
                     "farneback_rejected",
                     "regional_temporal_fallback",
+                    "deadline_degraded_midpoint",
                 }
                 else str(active_providers[0]) if active_providers else "none"
             ),
@@ -566,6 +573,24 @@ class AsyncFramePipeline:
         """Generate one to four ordered frames with a midpoint-only interpolator."""
 
         interpolate = self._frame_interpolator.interpolate
+
+        if self.generated_frames == 2 and self._two_frame_deadline_missed:
+            image = interpolate(frame_a, frame_b)
+            # Keep the downgrade visible to telemetry and evaluation.  This is
+            # one midpoint, not a successful two-insertion result.
+            try:
+                self._frame_interpolator.last_generation_method = (
+                    "deadline_degraded_midpoint"
+                )
+            except (AttributeError, TypeError):
+                pass
+            return [
+                (
+                    0.5,
+                    image,
+                    getattr(self._frame_interpolator, "last_regional_result", None),
+                )
+            ]
 
         if self.generated_frames == 2:
             interpolate_at = getattr(self._frame_interpolator, "interpolate_at", None)
@@ -716,6 +741,27 @@ class AsyncFramePipeline:
                             current_image,
                         )
                         interpolation_ms = (self._clock() - interpolation_started) * 1000.0
+                        if self.generated_frames == 2 and len(generated_images) == 2:
+                            self._two_frame_pair_cost_ms = interpolation_ms
+                            configured_budget = getattr(
+                                self._frame_interpolator,
+                                "regional_budget_ms",
+                                None,
+                            )
+                            pair_budget_ms = max(
+                                1000.0 / 30.0,
+                                2.0 * float(configured_budget)
+                                if configured_budget is not None
+                                else 0.0,
+                            )
+                            if interpolation_ms > pair_budget_ms:
+                                self._two_frame_deadline_missed = True
+                                logger.warning(
+                                    "Two-insertion generation took %.2f ms (budget %.2f ms); "
+                                    "degrading to the stable 1x midpoint path for this session.",
+                                    interpolation_ms,
+                                    pair_budget_ms,
+                                )
                         with self._state_lock:
                             self._interpolated_frames += len(generated_images)
                     except Exception as error:

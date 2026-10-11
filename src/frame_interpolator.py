@@ -975,36 +975,47 @@ class RIFEInterpolator(FrameInterpolator):
                 self.output_dimensions = (output.shape[1], output.shape[0])
                 return np.ascontiguousarray(output)
         full_height, full_width = frame_a.shape[:2]
-        if (full_width, full_height) != (width, height):
-            flow_forward = cv2.resize(
-                flow_forward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+        if self.regional_transform and self.regional_controller is not None:
+            # The regional candidate is needed only in admitted motion areas.
+            # Upscale that small candidate once, then combine it with a sharp
+            # full-resolution endpoint fallback below. Expanding the flow and
+            # remapping both 720p endpoints cost more than 200 ms in live runs.
+            candidate = cv2.resize(
+                candidate_small,
+                (full_width, full_height),
+                interpolation=cv2.INTER_LINEAR,
             )
-            flow_backward = cv2.resize(
-                flow_backward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+        else:
+            if (full_width, full_height) != (width, height):
+                flow_forward = cv2.resize(
+                    flow_forward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+                )
+                flow_backward = cv2.resize(
+                    flow_backward, (full_width, full_height), interpolation=cv2.INTER_LINEAR
+                )
+                flow_forward[..., 0] *= full_width / width
+                flow_forward[..., 1] *= full_height / height
+                flow_backward[..., 0] *= full_width / width
+                flow_backward[..., 1] *= full_height / height
+                height, width = full_height, full_width
+                x, y = np.meshgrid(
+                    np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
+                )
+                map_first_x = x - position * flow_forward[..., 0]
+                map_first_y = y - position * flow_forward[..., 1]
+                map_second_x = x - (1.0 - position) * flow_backward[..., 0]
+                map_second_y = y - (1.0 - position) * flow_backward[..., 1]
+            warped_first = cv2.remap(
+                frame_a, map_first_x, map_first_y, cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
             )
-            flow_forward[..., 0] *= full_width / width
-            flow_forward[..., 1] *= full_height / height
-            flow_backward[..., 0] *= full_width / width
-            flow_backward[..., 1] *= full_height / height
-            height, width = full_height, full_width
-            x, y = np.meshgrid(
-                np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)
+            warped_second = cv2.remap(
+                frame_b, map_second_x, map_second_y, cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
             )
-            map_first_x = x - position * flow_forward[..., 0]
-            map_first_y = y - position * flow_forward[..., 1]
-            map_second_x = x - (1.0 - position) * flow_backward[..., 0]
-            map_second_y = y - (1.0 - position) * flow_backward[..., 1]
-        warped_first = cv2.remap(
-            frame_a, map_first_x, map_first_y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-        warped_second = cv2.remap(
-            frame_b, map_second_x, map_second_y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-        candidate = cv2.addWeighted(
-            warped_first, 1.0 - position, warped_second, position, 0.0
-        )
+            candidate = cv2.addWeighted(
+                warped_first, 1.0 - position, warped_second, position, 0.0
+            )
         post_started = time.perf_counter()
         if self.regional_transform and self.regional_controller is not None:
             regional_result = self.last_regional_result
@@ -1046,7 +1057,8 @@ class RIFEInterpolator(FrameInterpolator):
         else:
             self.last_interpolation_confidence = 0.0
             self.last_stabilized_fraction = 1.0
-        candidate = self._restore_static_detail(candidate, frame_a, frame_b)
+        if not self.regional_transform:
+            candidate = self._restore_static_detail(candidate, frame_a, frame_b)
         self.last_preprocessing_ms = max(0.0, self.last_preprocessing_ms or 0.0)
         self.last_postprocessing_ms = (time.perf_counter() - post_started) * 1000.0
         self.last_total_ms = (time.perf_counter() - total_started) * 1000.0
