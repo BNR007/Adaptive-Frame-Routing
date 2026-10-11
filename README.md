@@ -1,10 +1,10 @@
 <div align="center">
 
-# URFTS / UniversalUpscaler
+# Adaptive Frame Routing (FrameRoute)
 
-### Universal Real-Time Frame Transformation Software
+### Confidence- and deadline-aware regional frame transformation
 
-**A Windows application for real-time capture, upscaling, frame interpolation, pacing, and presentation.**
+**Research software for renderer-independent capture, regional enhancement, frame interpolation, pacing, and presentation.**
 
 ![Python](https://img.shields.io/badge/Python-3.11+-blue)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6)
@@ -24,8 +24,8 @@ The clickable GUI provides target-window selection, WGC capture, CPU or experime
 Use Python 3.11 or newer on Windows:
 
 ```powershell
-git clone https://github.com/Youkaiduan57/Universal-Real-Time-Frame-Transformation-Software-URFTS-.git
-cd Universal-Real-Time-Frame-Transformation-Software-URFTS-
+git clone https://github.com/BNR007/Adaptive-Frame-Routing.git
+cd Adaptive-Frame-Routing
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
