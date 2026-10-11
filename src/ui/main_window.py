@@ -40,7 +40,7 @@ from ui.controller import (
     SRVGG_MODEL,
     RuntimeConfiguration,
 )
-from ui.settings_store import GuiSettings, SettingsStore
+from ui.settings_store import IRIS_RESEARCH_PROFILE, GuiSettings, SettingsStore
 from ui.theme import apply_theme
 from ui.widgets import (
     AccentButton,
@@ -225,6 +225,7 @@ class MainWindow(QMainWindow):
         self.upscaling_card = self._build_upscaling_card()
         self.capture_card = self._build_capture_card()
         self.rendering_card = self._build_rendering_card()
+        self.research_card = self._build_research_card()
         self.ai_card = self._build_ai_card()
         self.status_card = self._build_status_card()
         self._workspace_cards = (
@@ -232,6 +233,7 @@ class MainWindow(QMainWindow):
             self.upscaling_card,
             self.capture_card,
             self.rendering_card,
+            self.research_card,
             self.ai_card,
             self.status_card,
         )
@@ -283,6 +285,60 @@ class MainWindow(QMainWindow):
         self.frame_generation_control = ModeBinding(
             self.frame_generation_enabled, self.frame_type_combo, off="off", parent=self
         )
+        return card
+
+    def _build_research_card(self) -> SettingsCard:
+        card = SettingsCard("Research Run")
+        self.research_enabled = Switch()
+        self.research_enabled.setAccessibleName("Record an IRIS research run")
+        card.add_row(SettingsRow("Enabled", self.research_enabled))
+
+        self.research_machine = QLineEdit()
+        self.research_machine.setAccessibleName("Research machine ID")
+        card.add_row(SettingsRow("Machine ID", self.research_machine))
+        self.research_application = QLineEdit()
+        self.research_application.setAccessibleName("Research application")
+        card.add_row(SettingsRow("Application", self.research_application))
+        self.research_scene = QLineEdit()
+        self.research_scene.setAccessibleName("Research scene ID")
+        card.add_row(SettingsRow("Scene ID", self.research_scene))
+        self.research_condition = _combo(
+            (
+                ("capture_presentation", "B · Capture / presentation"),
+                ("whole_frame_fg", "C · Whole-frame FG"),
+                ("adaptive_routing", "D · Adaptive routing"),
+            ),
+            "Research condition",
+        )
+        card.add_row(SettingsRow("Condition", self.research_condition))
+        self.research_repetition = QSpinBox()
+        self.research_repetition.setRange(1, 999)
+        card.add_row(SettingsRow("Repetition", self.research_repetition))
+        self.research_warmup = QDoubleSpinBox()
+        self.research_warmup.setRange(0.0, 600.0)
+        self.research_warmup.setSuffix(" s")
+        card.add_row(SettingsRow("Warm-up", self.research_warmup))
+        self.research_duration = QDoubleSpinBox()
+        self.research_duration.setRange(1.0, 3600.0)
+        self.research_duration.setSuffix(" s")
+        card.add_row(SettingsRow("Measured duration", self.research_duration))
+        self.research_root = QLineEdit()
+        self.research_root.setAccessibleName("Research output folder")
+        self.research_browse = QPushButton("Browse…")
+        root_controls = QWidget()
+        root_layout = QHBoxLayout(root_controls)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(5)
+        root_layout.addWidget(self.research_root, 1)
+        root_layout.addWidget(self.research_browse)
+        card.add_row(SettingsRow("Output folder", root_controls))
+        note = QLabel(
+            "Records per-frame telemetry and resources after the warm-up, then stops automatically. "
+            "Existing run folders are never overwritten."
+        )
+        note.setObjectName("rowDescription")
+        note.setWordWrap(True)
+        card.add_widget(note)
         return card
 
     def _build_upscaling_card(self) -> SettingsCard:
@@ -685,6 +741,27 @@ class MainWindow(QMainWindow):
         self.fsr_sharpening_strength.valueChanged.connect(lambda _value: self._settings_changed())
         self.fsr_edge_strength.valueChanged.connect(lambda _value: self._settings_changed())
         self.status_details_button.toggled.connect(self._status_details_toggled)
+        self.research_enabled.toggled.connect(lambda _checked: self._settings_changed())
+        for editor in (
+            self.research_machine,
+            self.research_application,
+            self.research_scene,
+            self.research_root,
+        ):
+            editor.editingFinished.connect(self._settings_changed)
+        self.research_condition.currentIndexChanged.connect(
+            self._research_condition_changed
+        )
+        self.research_repetition.valueChanged.connect(
+            lambda _value: self._settings_changed()
+        )
+        self.research_warmup.valueChanged.connect(
+            lambda _value: self._settings_changed()
+        )
+        self.research_duration.valueChanged.connect(
+            lambda _value: self._settings_changed()
+        )
+        self.research_browse.clicked.connect(self._browse_research_root)
 
         self.add_profile_button.clicked.connect(lambda: self._add_profile())
         self.rename_profile_button.clicked.connect(lambda: self._rename_profile())
@@ -759,6 +836,17 @@ class MainWindow(QMainWindow):
         self.fsr_sharpening.setChecked(self.settings.fsr1_like_sharpening)
         self.fsr_sharpening_strength.setValue(self.settings.fsr1_like_sharpening_strength)
         self.fsr_edge_strength.setValue(self.settings.fsr1_like_edge_strength)
+        self.research_enabled.setChecked(self.settings.research_enabled)
+        self.research_machine.setText(self.settings.research_machine_id)
+        self.research_application.setText(self.settings.research_application)
+        self.research_scene.setText(self.settings.research_scene)
+        self._set_combo(self.research_condition, self.settings.research_condition)
+        self.research_repetition.setValue(self.settings.research_repetition)
+        self.research_warmup.setValue(self.settings.research_warmup_seconds)
+        self.research_duration.setValue(self.settings.research_duration_seconds)
+        self.research_root.setText(
+            self.settings.research_root or str(PROJECT_ROOT / "data" / "raw")
+        )
         self.status_details_button.setChecked(self.settings.status_details_visible)
         self.status_details_panel.setVisible(self.settings.status_details_visible)
         self.status_details_button.setText(
@@ -852,6 +940,17 @@ class MainWindow(QMainWindow):
         self.settings.fsr1_like_sharpening = self.fsr_sharpening.isChecked()
         self.settings.fsr1_like_sharpening_strength = self.fsr_sharpening_strength.value()
         self.settings.fsr1_like_edge_strength = self.fsr_edge_strength.value()
+        self.settings.research_enabled = self.research_enabled.isChecked()
+        self.settings.research_machine_id = self.research_machine.text().strip()
+        self.settings.research_application = self.research_application.text().strip()
+        self.settings.research_scene = self.research_scene.text().strip()
+        self.settings.research_condition = str(
+            self.research_condition.currentData() or "adaptive_routing"
+        )
+        self.settings.research_repetition = self.research_repetition.value()
+        self.settings.research_warmup_seconds = self.research_warmup.value()
+        self.settings.research_duration_seconds = self.research_duration.value()
+        self.settings.research_root = self.research_root.text().strip()
         self.settings.status_details_visible = self.status_details_button.isChecked()
         profile_payload = asdict(self.settings)
         for key in ("theme", "profiles", "selected_profile", "profile_settings", "status_details_visible"):
@@ -902,8 +1001,9 @@ class MainWindow(QMainWindow):
         self.profile_heading_label.setText(f'Profile: "{name}"')
         for button in self._profile_buttons:
             button.setChecked(button.property("profileName") == name)
-        self.rename_profile_button.setEnabled(name != "Default")
-        self.delete_profile_button.setEnabled(name != "Default")
+        protected = name in {"Default", IRIS_RESEARCH_PROFILE}
+        self.rename_profile_button.setEnabled(not protected)
+        self.delete_profile_button.setEnabled(not protected)
         self._show_view(self.workspace_page)
         if save:
             self._save_settings()
@@ -927,7 +1027,7 @@ class MainWindow(QMainWindow):
 
     def _rename_profile(self, name: str | None = None) -> None:
         current = self.settings.selected_profile
-        if current == "Default":
+        if current in {"Default", IRIS_RESEARCH_PROFILE}:
             return
         if name is None:
             name, accepted = QInputDialog.getText(self, "Rename profile", "Profile name:", text=current)
@@ -945,7 +1045,7 @@ class MainWindow(QMainWindow):
 
     def _delete_profile(self) -> None:
         current = self.settings.selected_profile
-        if current == "Default":
+        if current in {"Default", IRIS_RESEARCH_PROFILE}:
             return
         self.settings.profiles.remove(current)
         self.settings.profile_settings.pop(current, None)
@@ -1042,6 +1142,31 @@ class MainWindow(QMainWindow):
         self.model_combo.setItemText(1, f"Custom: {Path(path).name}")
         self.model_combo.setCurrentIndex(1)
         self.model_path_label.setText(self._custom_model_path)
+        self._settings_changed()
+
+    def _browse_research_root(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Research output folder",
+            self.research_root.text() or str(PROJECT_ROOT / "data" / "raw"),
+        )
+        if selected:
+            self.research_root.setText(selected)
+            self._settings_changed()
+
+    def _research_condition_changed(self, _index: int) -> None:
+        if self._loading:
+            return
+        condition = str(self.research_condition.currentData())
+        if condition == "capture_presentation":
+            self.frame_generation_control.set_value("off")
+            self.regional_transform.setChecked(False)
+        elif condition == "whole_frame_fg":
+            self.frame_generation_control.set_value("rife")
+            self.regional_transform.setChecked(False)
+        else:
+            self.frame_generation_control.set_value("rife")
+            self.regional_transform.setChecked(True)
         self._settings_changed()
 
     def _status_details_toggled(self, checked: bool) -> None:
@@ -1164,6 +1289,19 @@ class MainWindow(QMainWindow):
             ai_enabled and self.model_combo.currentData() == "custom"
         )
         self.custom_fps.setVisible(self.fps_combo.currentData() == "custom")
+        research_enabled = self.research_enabled.isChecked()
+        for widget in (
+            self.research_machine,
+            self.research_application,
+            self.research_scene,
+            self.research_condition,
+            self.research_repetition,
+            self.research_warmup,
+            self.research_duration,
+            self.research_root,
+            self.research_browse,
+        ):
+            widget.setEnabled(research_enabled)
         self._update_compatibility()
         self._apply_responsive_layout()
 
@@ -1258,6 +1396,19 @@ class MainWindow(QMainWindow):
             fsr1_like_sharpening=self.fsr_sharpening.isChecked(),
             fsr1_like_sharpening_strength=self.fsr_sharpening_strength.value(),
             fsr1_like_edge_strength=self.fsr_edge_strength.value(),
+            research_enabled=self.research_enabled.isChecked(),
+            research_root=Path(
+                self.research_root.text().strip() or PROJECT_ROOT / "data" / "raw"
+            ),
+            research_machine_id=self.research_machine.text().strip(),
+            research_application=self.research_application.text().strip(),
+            research_scene=self.research_scene.text().strip(),
+            research_condition=str(
+                self.research_condition.currentData() or "adaptive_routing"
+            ),
+            research_repetition=self.research_repetition.value(),
+            research_warmup_seconds=self.research_warmup.value(),
+            research_duration_seconds=self.research_duration.value(),
         )
 
     def _update_start_enabled(self) -> None:
@@ -1292,6 +1443,7 @@ class MainWindow(QMainWindow):
             self.upscaling_card,
             self.capture_card,
             self.rendering_card,
+            self.research_card,
             self.ai_card,
             self.add_profile_button,
             self.rename_profile_button,
@@ -1378,7 +1530,7 @@ class MainWindow(QMainWindow):
         self._workspace_layout_signature = signature
         for index, card in enumerate(cards):
             row, column = divmod(index, columns)
-            self.workspace_grid.addWidget(card, row, column)
+            self.workspace_grid.addWidget(card, row, column, Qt.AlignmentFlag.AlignTop)
         for column in range(columns):
             self.workspace_grid.setColumnStretch(column, 1)
 

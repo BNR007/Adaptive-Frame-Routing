@@ -3,7 +3,11 @@ build/
 dist/
 output/*
 .pytest-tmp/
+.pytest_tmp*/
 .pytest_cache/
+data/raw/
+LocalLow/
+userdata/UniversalUpscaler/logs/
 __pycache__/
 *.pyc
 *.spec

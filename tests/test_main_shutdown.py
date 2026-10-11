@@ -440,7 +440,7 @@ def test_preview_overlay_starts_with_zero_fps(monkeypatch) -> None:
         telemetry=None,
     )
 
-    assert lines == ["0.0 FPS"]
+    assert lines == ["Scheduler 0.0/s"]
 
 
 def test_preview_overlay_shows_current_presentation_fps(
@@ -485,7 +485,7 @@ def test_preview_overlay_shows_current_presentation_fps(
         telemetry=telemetry,
     )
 
-    assert lines == ["59.9 FPS"]
+    assert lines == ["Scheduler 59.9/s"]
 
 
 def test_preview_overlay_uses_measured_fps_until_presentation_rate_is_ready(
@@ -532,4 +532,36 @@ def test_preview_overlay_uses_measured_fps_until_presentation_rate_is_ready(
         telemetry=telemetry,
     )
 
-    assert lines == ["24.0 FPS"]
+    assert lines == ["Scheduler 24.0/s"]
+
+
+def test_preview_overlay_distinguishes_calls_from_unique_output(monkeypatch) -> None:
+    lines = []
+    monkeypatch.setattr(
+        main.cv2,
+        "putText",
+        lambda frame, text, *args, **kwargs: lines.append(text),
+    )
+
+    main._draw_preview_overlay(
+        object(),
+        capture_backend="wgc",
+        opencv_threads=2,
+        capture_dimensions=(1280, 720),
+        window_title="Game",
+        processor_name="OpenCV CPU",
+        upscaler_name="Bicubic",
+        telemetry=None,
+        output_analysis={
+            "calls_per_second": 60.0,
+            "unique_per_second": 31.0,
+            "meaningful_per_second": 29.0,
+            "presentation_interval_ms": 16.7,
+        },
+    )
+
+    assert lines == [
+        "Scheduler 0.0/s",
+        "Preview 60.0/s  Unique 31.0/s  Motion 29.0/s",
+        "Gap 16.7 ms",
+    ]

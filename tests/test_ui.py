@@ -14,7 +14,7 @@ import pytest
 
 from ui.controller import GuiController, PRESETS, RIFE_MODEL, SRVGG_MODEL, RuntimeConfiguration
 from ui.main_window import MainWindow
-from ui.settings_store import GuiSettings, SettingsStore
+from ui.settings_store import IRIS_RESEARCH_PROFILE, GuiSettings, SettingsStore
 from window_capture import WindowInfo
 
 
@@ -104,13 +104,13 @@ def test_profile_selection_and_local_persistence(qt_app, tmp_path: Path) -> None
     assert window.method_combo.currentData() == "bicubic"
     window._rename_profile("Game")
     assert window.settings.selected_profile == "Game"
-    assert store.load().profiles == ["Default", "Game"]
+    assert store.load().profiles == ["Default", IRIS_RESEARCH_PROFILE, "Game"]
     window._delete_profile()
-    assert window.settings.profiles == ["Default"]
+    assert window.settings.profiles == ["Default", IRIS_RESEARCH_PROFILE]
     assert window.settings.selected_profile == "Default"
     window.close()
     loaded = store.load()
-    assert loaded.profiles == ["Default"]
+    assert loaded.profiles == ["Default", IRIS_RESEARCH_PROFILE]
     assert loaded.selected_profile == "Default"
 
 
@@ -137,6 +137,64 @@ def test_model_selection_and_ai_adapter_configuration(qt_app, tmp_path: Path) ->
     args = configuration.to_engine_args()
     assert args.model == custom_model
     assert args.ai_scale == "4"
+    window.close()
+
+
+def test_iris_research_profile_and_condition_routing(qt_app, tmp_path: Path) -> None:
+    window = make_window(qt_app, tmp_path)
+    window._select_profile(IRIS_RESEARCH_PROFILE)
+    configuration = window._configuration()
+    assert configuration.research_enabled is True
+    assert configuration.capture_backend == "wgc"
+    assert configuration.upscaling_method == "bicubic"
+    assert configuration.frame_generation == "rife"
+    assert configuration.generated_frames == 1
+    assert configuration.provider == "cpu"
+    assert configuration.preset == "performance"
+    assert configuration.target_fps == pytest.approx(60.0)
+    assert configuration.frame_pacing == "fixed"
+    assert configuration.regional_transform is True
+    assert configuration.regional_budget_ms == pytest.approx(34.0)
+    assert configuration.research_warmup_seconds == pytest.approx(30.0)
+    assert configuration.research_duration_seconds == pytest.approx(60.0)
+
+    window.research_condition.setCurrentIndex(
+        window.research_condition.findData("capture_presentation")
+    )
+    assert window._configuration().frame_generation == "off"
+    assert window._configuration().regional_transform is False
+    window.research_condition.setCurrentIndex(
+        window.research_condition.findData("whole_frame_fg")
+    )
+    assert window._configuration().frame_generation == "rife"
+    assert window._configuration().regional_transform is False
+    window.research_condition.setCurrentIndex(
+        window.research_condition.findData("adaptive_routing")
+    )
+    assert window._configuration().regional_transform is True
+    window.close()
+
+
+def test_workspace_cards_keep_content_height_in_two_column_layout(
+    qt_app, tmp_path: Path
+) -> None:
+    window = make_window(qt_app, tmp_path)
+    window.resize(1450, 900)
+    window.show()
+    qt_app.processEvents()
+    window._select_profile(IRIS_RESEARCH_PROFILE)
+    window._apply_responsive_layout(1100)
+    qt_app.processEvents()
+
+    assert window.workspace_column_count == 2
+    for card in (
+        window.frame_card,
+        window.rendering_card,
+        window.research_card,
+    ):
+        assert card.height() >= card.sizeHint().height()
+
+    assert window.research_card.height() > window.status_card.height()
     window.close()
 
 

@@ -99,7 +99,11 @@ class SettingsCard(QFrame):
     def __init__(self, title: str, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("settingsCard")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        # Cards sharing a grid row may contain very different numbers of rows.
+        # A vertical Maximum policy lets the shorter card constrain that grid
+        # row, causing Qt to compress and overlap controls in the taller card.
+        # Fixed uses the card layout's live size hint, including visible rows.
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.content_layout = QVBoxLayout(self)
         self.content_layout.setContentsMargins(16, 14, 16, 14)
         self.content_layout.setSpacing(1)

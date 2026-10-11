@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, is_dataclass
 import logging
 from pathlib import Path
+import platform
 import threading
 from types import SimpleNamespace
 from typing import Callable
@@ -67,6 +68,15 @@ class RuntimeConfiguration:
     fsr1_like_sharpening: bool = True
     fsr1_like_sharpening_strength: float = 0.2
     fsr1_like_edge_strength: float = 0.35
+    research_enabled: bool = False
+    research_root: Path = PROJECT_ROOT / "data" / "raw"
+    research_machine_id: str = platform.node() or "machine"
+    research_application: str = "application"
+    research_scene: str = "scene_01"
+    research_condition: str = "adaptive_routing"
+    research_repetition: int = 1
+    research_warmup_seconds: float = 30.0
+    research_duration_seconds: float = 60.0
 
     def validate(self) -> None:
         if not 0.0 <= self.output_refinement <= 0.25:
@@ -117,6 +127,21 @@ class RuntimeConfiguration:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1.")
+        if self.research_enabled:
+            for value, name in (
+                (self.research_machine_id, "machine ID"),
+                (self.research_application, "application"),
+                (self.research_scene, "scene ID"),
+                (self.research_condition, "condition"),
+            ):
+                if not str(value).strip():
+                    raise ValueError(f"Research {name} cannot be empty.")
+            if self.research_repetition <= 0:
+                raise ValueError("Research repetition must be positive.")
+            if self.research_warmup_seconds < 0.0:
+                raise ValueError("Research warm-up cannot be negative.")
+            if self.research_duration_seconds <= 0.0:
+                raise ValueError("Research duration must be positive.")
         if self.upscaling_mode == "ai":
             model_path = Path(self.model_path)
             if not model_path.is_file():
@@ -182,6 +207,15 @@ class RuntimeConfiguration:
             allow_provider_fallback=self.allow_provider_fallback,
             persist_runtime_profile=True,
             keep_latest_real=True,
+            research_run=self.research_enabled,
+            research_root=Path(self.research_root),
+            research_machine_id=self.research_machine_id,
+            research_application=self.research_application,
+            research_scene=self.research_scene,
+            research_condition=self.research_condition,
+            research_repetition=self.research_repetition,
+            research_warmup_seconds=self.research_warmup_seconds,
+            research_duration_seconds=self.research_duration_seconds,
         )
 
 

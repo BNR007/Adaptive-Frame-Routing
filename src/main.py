@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import platform
 import signal
 import sys
 import threading
@@ -41,6 +42,7 @@ from frame_pacing import (
     DEFAULT_MAX_FRAME_LATENCY_MS,
     FramePacer,
     PresentationFrame,
+    PacingSnapshot,
 )
 from d3d11_gpu_pipeline import (
     D3D11CapabilityError,
@@ -67,6 +69,12 @@ from runtime_recovery import (
 )
 from resource_paths import resource_path
 from regional_transform import RegionalTransformController
+from research_run import (
+    OutputFrameAnalyzer,
+    ResearchRunRecorder,
+    ResearchRunSpec,
+    find_presentmon,
+)
 from wgc_capture import WGCError
 from window_capture import (
     WindowCaptureError,
@@ -258,6 +266,46 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Warm up processing for this many seconds before session counters begin.",
+    )
+    parser.add_argument(
+        "--research-run",
+        action="store_true",
+        help="Record a reproducible warm-up and measured live research run.",
+    )
+    parser.add_argument(
+        "--research-root",
+        type=Path,
+        default=resource_path("data", "raw"),
+        help="Root directory for immutable research-run artifacts.",
+    )
+    parser.add_argument("--research-machine-id", default=platform.node() or "machine")
+    parser.add_argument("--research-application", default="application")
+    parser.add_argument("--research-scene", default="scene_01")
+    parser.add_argument("--research-condition", default="adaptive_routing")
+    parser.add_argument("--research-repetition", type=_positive_int_argument, default=1)
+    parser.add_argument(
+        "--research-warmup-seconds",
+        type=float,
+        default=30.0,
+        help="Live warm-up excluded from research summaries.",
+    )
+    parser.add_argument(
+        "--research-duration-seconds",
+        type=_positive_float_argument,
+        default=60.0,
+        help="Measured live-run duration before automatic stop.",
+    )
+    parser.add_argument(
+        "--research-presentmon",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record PresentMon events beside research telemetry when PresentMon is available.",
+    )
+    parser.add_argument(
+        "--presentmon-path",
+        type=Path,
+        default=None,
+        help="Optional PresentMon executable; Downloads, PATH, and PRESENTMON_PATH are searched otherwise.",
     )
     parser.add_argument(
         "--preview-fullscreen",
@@ -751,21 +799,51 @@ def _draw_preview_overlay(
     processor_name: str,
     upscaler_name: str,
     telemetry: TelemetrySnapshot | None,
+    output_analysis: dict | None = None,
 ) -> None:
-    """Draw the current output presentation rate."""
+    """Draw explicitly scoped submission and effective-output rates."""
 
     presentation_fps = 0.0
     if telemetry is not None:
         presentation_fps = telemetry.presentation_fps or telemetry.fps
-    cv2.putText(
-        frame,
-        f"{presentation_fps:.1f} FPS",
-        (16, 36),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
+    lines = [f"Scheduler {presentation_fps:.1f}/s"]
+    if output_analysis:
+        lines.append(
+            "Preview %.1f/s  Unique %.1f/s  Motion %.1f/s" % (
+                float(output_analysis.get("calls_per_second", 0.0)),
+                float(output_analysis.get("unique_per_second", 0.0)),
+                float(output_analysis.get("meaningful_per_second", 0.0)),
+            )
+        )
+        interval = float(output_analysis.get("presentation_interval_ms", 0.0))
+        if interval > 0.0:
+            lines.append(f"Gap {interval:.1f} ms")
+    for index, line in enumerate(lines):
+        cv2.putText(
+            frame, line, (16, 36 + index * 28), cv2.FONT_HERSHEY_SIMPLEX,
+            0.72, (255, 255, 255), 2, cv2.LINE_AA,
+        )
+
+
+def _log_effective_output(
+    logger: logging.Logger,
+    pacing_snapshot: PacingSnapshot,
+    output_snapshot: dict,
+    latest_analysis: dict,
+) -> None:
+    """Log rates with names that do not overclaim physical display output."""
+
+    logger.info(
+        "Effective output: scheduler releases %.2f/s, preview submissions %.2f/s, "
+        "exact-unique %.2f/s, meaningful-motion %.2f/s, latest gap %.2f ms, "
+        "scheduler p95 gap %.2f ms, cadence misses %s",
+        pacing_snapshot.presentation_fps,
+        float(output_snapshot.get("calls_per_second", 0.0)),
+        float(output_snapshot.get("unique_per_second", 0.0)),
+        float(output_snapshot.get("meaningful_per_second", 0.0)),
+        float(latest_analysis.get("presentation_interval_ms", 0.0)),
+        pacing_snapshot.presentation_interval_p95_ms,
+        pacing_snapshot.cadence_misses,
     )
 
 
@@ -1210,6 +1288,60 @@ def run_application(
             or "no execution provider",
         )
 
+    research_recorder = None
+    if bool(getattr(args, "research_run", False)):
+        try:
+            research_spec = ResearchRunSpec(
+                root=Path(getattr(args, "research_root", resource_path("data", "raw"))),
+                machine_id=str(getattr(args, "research_machine_id", platform.node() or "machine")),
+                application=str(getattr(args, "research_application", "application")),
+                scene_id=str(getattr(args, "research_scene", "scene_01")),
+                condition=str(getattr(args, "research_condition", "adaptive_routing")),
+                repetition=int(getattr(args, "research_repetition", 1)),
+                warmup_seconds=float(getattr(args, "research_warmup_seconds", 30.0)),
+                duration_seconds=float(getattr(args, "research_duration_seconds", 60.0)),
+            )
+            research_recorder = ResearchRunRecorder(
+                research_spec,
+                project_root=resource_path(),
+                hwnd=(selected_window.hwnd if selected_window is not None else 0),
+                window_title=window_title,
+                configuration=vars(args),
+                presentmon_path=(
+                    find_presentmon(getattr(args, "presentmon_path", None))
+                    if bool(getattr(args, "research_presentmon", True))
+                    else None
+                ),
+            )
+            run_directory = research_recorder.prepare()
+            logger.info("Research run artifacts: %s", run_directory)
+            logger.info(
+                "Research verification: condition=%s capture=%s pipeline=%s "
+                "frame_generation=%s generated=%s provider=%s model=%s regional=%s",
+                research_spec.condition,
+                capture.backend_name,
+                getattr(args, "pipeline", "cpu"),
+                getattr(args, "frame_generation", "off"),
+                getattr(args, "generated_frames", 1),
+                ",".join(getattr(frame_interpolator, "active_providers", ()))
+                if frame_interpolator is not None
+                else "disabled",
+                getattr(args, "rife_model", None) or "disabled",
+                getattr(args, "regional_transform", False),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            logger.error("Unable to prepare research run: %s", error)
+            capture.close()
+            processor.close()
+            if frame_interpolator is not None:
+                frame_interpolator.shutdown()
+            if processing_backend is not None:
+                processing_close = getattr(processing_backend, "close", None)
+                if processing_close is not None:
+                    processing_close()
+            cv2.destroyAllWindows()
+            return
+
     thread_bound_capture = capture.backend_name == "wgc"
     if thread_bound_capture:
         capture.prepare_thread_handoff()
@@ -1257,6 +1389,8 @@ def run_application(
                 )
     if not shutdown_event.is_set():
         pipeline.start()
+        if research_recorder is not None:
+            research_recorder.begin_timing()
         publish_state("running")
     counter_baseline_real = 0
     counter_baseline_generated = 0
@@ -1264,12 +1398,35 @@ def run_application(
     preview_initialized = False
     game_preview = None
     last_refinement_ms = 0.0
+    last_research_status = None
+    research_completed = False
+    # The content-change analyzer is research instrumentation. Keep it out of
+    # ordinary gameplay so data collection cannot reduce the stable profile.
+    output_analyzer = OutputFrameAnalyzer() if research_recorder is not None else None
+    last_output_analysis: dict = {}
 
     try:
         try:
             while True:
                 if shutdown_event.is_set():
                     break
+                if research_recorder is not None:
+                    research_now = time.perf_counter()
+                    research_phase = research_recorder.phase(research_now)
+                    research_remaining = math.ceil(
+                        research_recorder.remaining_seconds(research_now)
+                    )
+                    research_status = (research_phase, research_remaining)
+                    if research_status != last_research_status:
+                        if research_phase == "warmup":
+                            publish_state(f"research_warmup_{research_remaining}")
+                        elif research_phase == "measuring":
+                            publish_state(f"research_measuring_{research_remaining}")
+                        last_research_status = research_status
+                    if research_phase == "complete":
+                        research_completed = True
+                        logger.info("Research measurement completed; stopping automatically.")
+                        break
                 if game_preview is not None:
                     if game_preview.stop_requested() or not game_preview.update():
                         break
@@ -1283,6 +1440,7 @@ def run_application(
                         processed_frame,
                         processed_frame.captured_at,
                         processed_frame.frame_kind,
+                        processed_frame.sequence_id,
                     )
                     for processed_frame in processed_batch
                 )
@@ -1296,6 +1454,8 @@ def run_application(
                     pacing_snapshot = pacer.snapshot()
                     recovery_snapshot = recovery.snapshot()
                     telemetry_snapshot = None
+                    log_effective_output = False
+                    output_snapshot: dict = {}
                     if show_performance:
                         metrics.record(
                             presented_at=presented_at,
@@ -1347,6 +1507,7 @@ def run_application(
                             ),
                         )
                         if metrics.maybe_log(logger, now=presented_at):
+                            log_effective_output = True
                             logger.info("Preview refinement: previous sample %.2f ms", last_refinement_ms)
                             if processed_frame.regional_provenance_counts:
                                 logger.info(
@@ -1360,6 +1521,26 @@ def run_application(
                             telemetry_callback(telemetry_snapshot)
 
                     if args.no_preview:
+                        if output_analyzer is not None:
+                            last_output_analysis = output_analyzer.observe(
+                                frame, presented_at
+                            )
+                            output_snapshot = output_analyzer.snapshot(presented_at)
+                        if research_recorder is not None:
+                            research_recorder.record_frame(
+                                processed_frame=processed_frame,
+                                decision=decision,
+                                pacing_snapshot=pacing_snapshot,
+                                recovery_snapshot=recovery_snapshot,
+                                pipeline=pipeline,
+                                output_analysis=last_output_analysis,
+                                submitted_at=presented_at,
+                            )
+                        if log_effective_output and output_analyzer is not None:
+                            _log_effective_output(
+                                logger, pacing_snapshot, output_snapshot,
+                                last_output_analysis,
+                            )
                         continue
 
                     refinement_started = time.perf_counter()
@@ -1371,6 +1552,17 @@ def run_application(
                     ):
                         frame = RegionalTransformController.provenance_overlay(
                             frame, processed_frame.regional_provenance
+                        )
+                    # Sample the actual refined output before adding the
+                    # changing diagnostics overlay, which would make every
+                    # frame appear unique by construction.
+                    preview_submit_started = time.perf_counter()
+                    if output_analyzer is not None:
+                        last_output_analysis = output_analyzer.observe(
+                            frame, preview_submit_started
+                        )
+                        output_snapshot = output_analyzer.snapshot(
+                            preview_submit_started
                         )
                     if getattr(args, "draw_preview_overlay", True):
                         _draw_preview_overlay(
@@ -1391,6 +1583,7 @@ def run_application(
                                 runtime_profile.upscaling_method
                             ),
                             telemetry=telemetry_snapshot,
+                            output_analysis=output_snapshot,
                         )
 
                     preview_title = "UniversalUpscaler Preview"
@@ -1412,6 +1605,22 @@ def run_application(
                         preview_initialized = True
                     else:
                         cv2.imshow(preview_title, frame)
+                    submitted_at = time.perf_counter()
+                    if research_recorder is not None:
+                        research_recorder.record_frame(
+                            processed_frame=processed_frame,
+                            decision=decision,
+                            pacing_snapshot=pacing_snapshot,
+                            recovery_snapshot=recovery_snapshot,
+                            pipeline=pipeline,
+                            output_analysis=last_output_analysis,
+                            submitted_at=submitted_at,
+                        )
+                    if log_effective_output and output_analyzer is not None:
+                        _log_effective_output(
+                            logger, pacing_snapshot, output_snapshot,
+                            last_output_analysis,
+                        )
                     if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                         quit_requested = True
                         break
@@ -1443,6 +1652,22 @@ def run_application(
                     processing_close()
             cv2.destroyAllWindows()
             recovery.mark_stopped()
+            if research_recorder is not None:
+                research_summary = research_recorder.close(
+                    status="complete" if research_completed else "interrupted"
+                )
+                effective = research_summary.get("effective_output", {})
+                presentmon = research_summary.get("presentmon", {})
+                logger.info("Research results saved to %s", research_recorder.run_directory)
+                logger.info(
+                    "Research result: preview calls %.2f/s, unique %.2f/s, "
+                    "meaningful %.2f/s; PresentMon status=%s, display events=%s/s",
+                    float(research_summary.get("software_presentation_calls_per_second", 0.0)),
+                    float(effective.get("exact_unique_frames_per_second", 0.0)),
+                    float(effective.get("meaningful_motion_frames_per_second", 0.0)),
+                    presentmon.get("status", "unknown"),
+                    presentmon.get("observed_displayed_events_per_second", "unavailable"),
+                )
             publish_state("stopped")
 
 

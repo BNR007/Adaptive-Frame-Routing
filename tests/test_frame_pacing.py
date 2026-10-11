@@ -22,8 +22,13 @@ class FakeClock:
         return False
 
 
-def frame(value: str, captured_at: float, kind: str = "real") -> PresentationFrame:
-    return PresentationFrame(value, captured_at, kind)
+def frame(
+    value: str,
+    captured_at: float,
+    kind: str = "real",
+    sequence_id: int | None = None,
+) -> PresentationFrame:
+    return PresentationFrame(value, captured_at, kind, sequence_id)
 
 
 def test_fixed_scheduling_is_monotonic_and_evenly_spaced() -> None:
@@ -110,7 +115,24 @@ def test_maximum_latency_drops_real_and_generated_output() -> None:
     assert not any(decision.present for decision in decisions)
     snapshot = pacer.snapshot()
     assert snapshot.generated_frames_dropped_late == 1
+    assert snapshot.stale_generated_frames_dropped == 0
     assert snapshot.real_frames_dropped_late == 1
+
+
+def test_stale_generated_frame_is_identified_separately() -> None:
+    clock = FakeClock(2.0)
+    pacer = FramePacer(
+        mode="off",
+        max_frame_latency_ms=25,
+        clock=clock,
+        waiter=clock.wait,
+    )
+
+    decision = pacer.pace_batch([frame("M", 1.0, "generated")])[0]
+
+    assert not decision.present
+    assert decision.reason == "stale_generated"
+    assert pacer.snapshot().stale_generated_frames_dropped == 1
 
 
 def test_pacing_off_preserves_uncapped_behavior_without_waits() -> None:
@@ -193,6 +215,38 @@ def test_auto_mode_remains_uncapped_until_source_rate_is_reliable() -> None:
         pacer.pace_batch([frame(str(index), clock.value)])
     assert clock.waits == []
     assert pacer.snapshot().estimated_source_fps == pytest.approx(30.0)
+
+
+def test_source_rate_accounts_for_newest_frame_sequence_gaps() -> None:
+    clock = FakeClock()
+    pacer = FramePacer(mode="auto", clock=clock, waiter=clock.wait)
+    for index in range(6):
+        sequence_id = index * 4
+        clock.value = 100.0 + sequence_id / 60
+        pacer.pace_batch([
+            frame(str(index), clock.value, sequence_id=sequence_id)
+        ])
+
+    assert pacer.snapshot().estimated_source_fps == pytest.approx(60.0)
+
+
+def test_auto_mode_adds_one_slot_only_when_generated_cadence_becomes_reliable() -> None:
+    clock = FakeClock()
+    pacer = FramePacer(mode="auto", clock=clock, waiter=clock.wait)
+    for index in range(5):
+        clock.value = 100.0 + index / 30
+        pacer.pace_batch([frame(str(index), clock.value)])
+
+    clock.value = 100.0 + 5 / 30
+    decisions = pacer.pace_batch([
+        frame("M", clock.value, "generated"),
+        frame("B", clock.value),
+    ])
+
+    assert decisions[0].present
+    assert decisions[1].present
+    assert clock.waits[-2:] == pytest.approx([1 / 60, 1 / 60])
+    assert decisions[1].actual_at - decisions[0].actual_at == pytest.approx(1 / 60)
 
 
 def test_four_generated_frames_are_evenly_paced_and_counted_by_kind() -> None:
