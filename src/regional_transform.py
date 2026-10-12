@@ -634,6 +634,61 @@ class RegionalTransformController:
             admission_reason=self.last_admission_reason,
         )
 
+    def describe_precomposed_fallback(
+        self,
+        fallback_frame: np.ndarray,
+        *,
+        analysis: RegionalAnalysis,
+    ) -> RegionalResult:
+        """Record fallback provenance without recomputing an already-built frame.
+
+        The frame interpolator has already formed the midpoint when admission
+        rejects neural work.  The older path formed it again, expanded masks,
+        copied it twice, and then discarded that image after source-resolution
+        restoration.  This path keeps the scientific routing counters while
+        avoiding that duplicate pixel work.
+        """
+
+        started = time.perf_counter()
+        if fallback_frame.ndim != 3 or fallback_frame.dtype != np.uint8:
+            raise ValueError("Fallback frame must be a uint8 colour image.")
+        confidence_tiles = np.zeros(analysis.grid_shape, dtype=np.float32)
+        selected = np.zeros(analysis.grid_shape, dtype=bool)
+        provenance = np.full(
+            analysis.grid_shape,
+            RegionProvenance.MIDPOINT_BLEND,
+            dtype=np.uint8,
+        )
+        eligible = analysis.routes == RegionRoute.SMOOTH_MOTION
+        provenance[eligible] = (
+            RegionProvenance.DEADLINE_FALLBACK
+            if self.last_admission_reason == "deadline"
+            else RegionProvenance.ADMISSION_FALLBACK
+        )
+        output = fallback_frame
+        if analysis.scene_cut:
+            provenance.fill(RegionProvenance.REAL)
+        height, width = output.shape[:2]
+        pixel_confidence = np.zeros((height, width), dtype=np.float32)
+        endpoint_fallback = np.zeros((height, width), dtype=np.float32)
+        self._pending_prediction = output.copy()
+        self._pending_confidence = confidence_tiles
+        self._pending_shape = analysis.grid_shape
+        return RegionalResult(
+            frame=output,
+            provenance=provenance,
+            confidence=confidence_tiles,
+            pixel_confidence=pixel_confidence,
+            endpoint_fallback=endpoint_fallback,
+            selected=selected,
+            route_counts=self._counts(analysis.routes, RegionRoute),
+            provenance_counts=self._counts(provenance, RegionProvenance),
+            analysis_ms=analysis.analysis_ms,
+            composition_ms=(time.perf_counter() - started) * 1000.0,
+            deadline_misses=int(np.count_nonzero(eligible)),
+            admission_reason=self.last_admission_reason,
+        )
+
     def observe_real_frame(self, actual: np.ndarray) -> float | None:
         """Update per-tile reliability after the next real frame becomes known."""
 

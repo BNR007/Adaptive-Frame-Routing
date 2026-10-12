@@ -263,11 +263,23 @@ events.
 
 ### Visibly unique frames
 
-After the measurement marker is implemented, enable a 16-bit Gray-code frame ID
-and checksum outside the quality-scored area. Film the monitor at 240 FPS or
-higher with fixed exposure. Decode IDs to report visible unique FPS, repeats,
-missing IDs, and disagreement with software submissions. Record camera model,
-mode, exposure, monitor refresh, and decoder accuracy.
+The **IRIS Research 720p30** profile draws a two-row 16-bit Gray-code frame ID
+and checksum in the top-right corner. It is added after quality analysis, so it
+does not affect PSNR, SSIM, or the content-change counter. Record the URFTS
+preview in OBS at 60 FPS, then run:
+
+```powershell
+python benchmarks\decode_visual_frame_marker.py `
+  --video "C:\path\to\obs-recording.mp4" `
+  --output-directory "output\visual-frame-check"
+```
+
+This reports compositor/OBS-visible unique FPS, repeated recording frames,
+invalid markers, and skipped marker IDs. Retain the generated CSV and JSON.
+This is stronger than counting software calls, but it is still not physical
+monitor scanout. For that claim, film the monitor at 240 FPS or higher with
+fixed exposure and decode the same marker. Record camera model, mode, exposure,
+monitor refresh, and decoder accuracy.
 
 ### Input-to-photon delay
 

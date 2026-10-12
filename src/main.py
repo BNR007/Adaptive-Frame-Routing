@@ -82,6 +82,7 @@ from window_capture import (
     list_visible_windows,
     select_window,
 )
+from visual_frame_marker import draw_visual_frame_marker
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +272,12 @@ def parse_args() -> argparse.Namespace:
         "--research-run",
         action="store_true",
         help="Record a reproducible warm-up and measured live research run.",
+    )
+    parser.add_argument(
+        "--visual-frame-marker",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw a decodable frame ID for OBS/compositor-visible frame measurement.",
     )
     parser.add_argument(
         "--research-root",
@@ -1407,6 +1414,7 @@ def run_application(
     # ordinary gameplay so data collection cannot reduce the stable profile.
     output_analyzer = OutputFrameAnalyzer() if research_recorder is not None else None
     last_output_analysis: dict = {}
+    visual_marker_id = 0
 
     try:
         try:
@@ -1589,6 +1597,11 @@ def run_application(
                             output_analysis=output_snapshot,
                         )
 
+                    current_visual_marker_id = None
+                    if getattr(args, "visual_frame_marker", False):
+                        current_visual_marker_id = visual_marker_id
+                        draw_visual_frame_marker(frame, visual_marker_id)
+
                     preview_title = "UniversalUpscaler Preview"
                     if not preview_initialized:
                         cv2.namedWindow(preview_title, cv2.WINDOW_NORMAL)
@@ -1609,6 +1622,8 @@ def run_application(
                     else:
                         cv2.imshow(preview_title, frame)
                     submitted_at = time.perf_counter()
+                    if current_visual_marker_id is not None:
+                        visual_marker_id = (visual_marker_id + 1) & 0xFFFF
                     if research_recorder is not None:
                         research_recorder.record_frame(
                             processed_frame=processed_frame,
@@ -1618,6 +1633,7 @@ def run_application(
                             pipeline=pipeline,
                             output_analysis=last_output_analysis,
                             submitted_at=submitted_at,
+                            visual_marker_id=current_visual_marker_id,
                         )
                     if log_effective_output and output_analyzer is not None:
                         _log_effective_output(

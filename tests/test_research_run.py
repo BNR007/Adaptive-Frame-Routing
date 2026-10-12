@@ -133,6 +133,7 @@ def test_research_run_records_only_measurement_and_summarizes(tmp_path: Path) ->
         pacing_snapshot=pacing(3.0, generated_drops=2),
         recovery_snapshot=recovery(),
         pipeline=pipeline(input_replacements=5),
+        visual_marker_id=7,
     )
     assert recorder.record_frame(
         processed_frame=frame(2, kind="real"),
@@ -157,6 +158,7 @@ def test_research_run_records_only_measurement_and_summarizes(tmp_path: Path) ->
         rows = list(csv.DictReader(source))
     assert len(rows) == 2
     assert rows[0]["active_provider"] == "CPUExecutionProvider"
+    assert rows[0]["visual_marker_id"] == "7"
     assert json.loads((run_directory / "manifest.json").read_text(encoding="utf-8"))["status"] == "complete"
 
 

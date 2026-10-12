@@ -208,6 +208,7 @@ class RuntimeConfiguration:
             persist_runtime_profile=True,
             keep_latest_real=True,
             research_run=self.research_enabled,
+            visual_frame_marker=self.research_enabled,
             research_root=Path(self.research_root),
             research_machine_id=self.research_machine_id,
             research_application=self.research_application,

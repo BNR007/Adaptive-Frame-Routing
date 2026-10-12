@@ -1239,9 +1239,8 @@ class RIFEInterpolator(FrameInterpolator):
                 )
             regional_candidate = output
             if skip_regional_inference:
-                self.last_regional_result = self.regional_controller.compose_fallback(
-                    inference_frame_a,
-                    inference_frame_b,
+                self.last_regional_result = self.regional_controller.describe_precomposed_fallback(
+                    output,
                     analysis=regional_analysis,
                 )
             else:
@@ -1303,6 +1302,11 @@ class RIFEInterpolator(FrameInterpolator):
                 )
                 output = np.ascontiguousarray(output)
                 fallback_mask = None
+                # This is already a source-resolution fallback.  Do not run
+                # the generic static-detail restoration below: that recomputed
+                # several full-frame masks, cost roughly 25-30 ms at 720p, and
+                # changed withheld-frame PSNR by only about 0.001 dB.
+                output_was_resized = False
             else:
                 # The expensive confidence composition has already happened at
                 # inference resolution. Enlarge that result once, then restore

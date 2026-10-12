@@ -784,6 +784,8 @@ def test_regional_transform_skips_model_when_no_tile_is_temporally_eligible(
         assert sessions[0].run_calls == 0
         assert interpolator.last_inference_ms == 0.0
         assert interpolator.last_duplicate_bypass
+        assert interpolator.last_regional_result is not None
+        assert interpolator.last_regional_result.composition_ms < 10.0
     finally:
         interpolator.shutdown()
 

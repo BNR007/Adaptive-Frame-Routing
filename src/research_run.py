@@ -34,6 +34,7 @@ FRAME_FIELDS = (
     "elapsed_seconds",
     "source_sequence_id",
     "output_frame_id",
+    "visual_marker_id",
     "frame_kind",
     "generation_method",
     "generation_position",
@@ -590,6 +591,7 @@ class ResearchRunRecorder:
         pipeline: Any,
         output_analysis: Mapping[str, Any] | None = None,
         submitted_at: float | None = None,
+        visual_marker_id: int | None = None,
     ) -> bool:
         # decision.actual_at is the scheduler release time.  In preview mode
         # the caller supplies the timestamp taken immediately after imshow so
@@ -639,6 +641,7 @@ class ResearchRunRecorder:
                 "elapsed_seconds": now - self._measurement_started_at,
                 "source_sequence_id": processed_frame.sequence_id,
                 "output_frame_id": self._output_id,
+                "visual_marker_id": "" if visual_marker_id is None else visual_marker_id,
                 "frame_kind": processed_frame.frame_kind,
                 "generation_method": processed_frame.generation_method,
                 "generation_position": processed_frame.generation_position,
