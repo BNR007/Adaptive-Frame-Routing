@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 from ctypes import wintypes
 
 import cv2
@@ -20,10 +21,51 @@ _D3D_DRIVER_TYPE_HARDWARE = 1
 _D3D_DRIVER_TYPE_WARP = 5
 
 
+class RefreshCadence:
+    """Map a target rate onto integer display-refresh intervals.
+
+    For example, 60 FPS on a 144 Hz display becomes the repeating sequence
+    2, 2, 3, 2, 3.  The fractional accumulator prevents a fixed two-refresh
+    interval from running at 72 Hz and prevents late work from being released
+    as a catch-up burst.
+    """
+
+    def __init__(self, refresh_hz: int, target_fps: float) -> None:
+        self.refresh_hz = max(1, int(refresh_hz))
+        self.target_fps = max(1.0, float(target_fps))
+        ratio = max(1.0, self.refresh_hz / self.target_fps)
+        self._ratio = min(4.0, ratio)
+        self._base = max(1, int(math.floor(self._ratio)))
+        self._fraction = self._ratio - self._base
+        self._error = 0.0
+
+    def next_interval(self) -> int:
+        interval = self._base
+        self._error += self._fraction
+        if self._error >= 1.0 - 1e-9 and interval < 4:
+            interval += 1
+            self._error -= 1.0
+        return interval
+
+    @property
+    def description(self) -> str:
+        if self._fraction <= 1e-9:
+            return str(self._base)
+        probe = RefreshCadence(self.refresh_hz, self.target_fps)
+        return "/".join(str(probe.next_interval()) for _ in range(5))
+
+
 class D3D11CpuFramePresenter:
     """Upload the newest CPU frame into a vsynced flip-discard swap chain."""
 
-    def __init__(self, width: int, height: int, *, vsync: bool = True) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        *,
+        vsync: bool = True,
+        target_fps: float = 60.0,
+    ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("Presenter dimensions must be positive.")
         self._device = ctypes.c_void_p()
@@ -40,9 +82,39 @@ class D3D11CpuFramePresenter:
                 height=height,
                 vsync=vsync,
             )
+            self.refresh_hz = self._display_refresh_hz()
+            self._cadence = RefreshCadence(self.refresh_hz, target_fps)
+            self.sync_interval = 1
+            self.presenter.sync_interval = self.sync_interval
         except Exception:
             self.close()
             raise
+
+    def _display_refresh_hz(self) -> int:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        user32.GetDC.argtypes = [wintypes.HWND]
+        user32.GetDC.restype = wintypes.HDC
+        user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+        user32.ReleaseDC.restype = ctypes.c_int
+        gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+        gdi32.GetDeviceCaps.restype = ctypes.c_int
+        device_context = user32.GetDC(self.presenter.hwnd)
+        if not device_context:
+            return 60
+        try:
+            refresh_hz = int(gdi32.GetDeviceCaps(device_context, 116))
+            return refresh_hz if refresh_hz > 1 else 60
+        finally:
+            user32.ReleaseDC(self.presenter.hwnd, device_context)
+
+    @staticmethod
+    def _sync_interval_for_target(refresh_hz: int, target_fps: float) -> int:
+        return RefreshCadence(refresh_hz, target_fps).next_interval()
+
+    @property
+    def cadence_description(self) -> str:
+        return self._cadence.description
 
     def _create_device(self) -> None:
         d3d11 = ctypes.WinDLL("d3d11", use_last_error=True)
@@ -110,6 +182,8 @@ class D3D11CpuFramePresenter:
         if self._bgra is None or self._bgra.shape != (height, width, 4):
             self._bgra = np.empty((height, width, 4), dtype=np.uint8)
         cv2.cvtColor(source, cv2.COLOR_BGR2BGRA, dst=self._bgra)
+        self.sync_interval = self._cadence.next_interval()
+        self.presenter.sync_interval = self.sync_interval
         _vtable_function(
             self._context,
             48,
@@ -144,4 +218,4 @@ class D3D11CpuFramePresenter:
         self._resized = None
 
 
-__all__ = ["D3D11CpuFramePresenter"]
+__all__ = ["D3D11CpuFramePresenter", "RefreshCadence"]

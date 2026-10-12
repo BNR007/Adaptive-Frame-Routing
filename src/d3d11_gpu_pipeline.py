@@ -65,6 +65,7 @@ _DXGI_ALPHA_MODE_IGNORE = 3
 _DXGI_MWA_NO_ALT_ENTER = 0x2
 
 _IID_IDXGI_DEVICE = _GUID.from_string("54EC77FA-1377-44E6-8C32-88FD5F44C84C")
+_IID_IDXGI_DEVICE1 = _GUID.from_string("77DB970F-6276-48BA-BA28-070143B4392C")
 _IID_IDXGI_FACTORY2 = _GUID.from_string("50C83A1C-E072-4C48-87B0-3630FA36A6D0")
 _IID_D3D11_TEXTURE2D = _GUID.from_string("6F15AAF2-D208-4E89-9AB4-489535D34F9C")
 
@@ -825,6 +826,7 @@ class D3D11SwapChainPresenter:
         self._render_target_view = ctypes.c_void_p()
         self._size = PresenterSizeState(width, height)
         self.vsync = bool(vsync)
+        self.sync_interval = 1 if self.vsync else 0
         self._quit_requested = False
         self._closed = False
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -1068,12 +1070,42 @@ class D3D11SwapChainPresenter:
                 ctypes.byref(self._swap_chain),
             )
             _check_hresult(result, "IDXGIFactory2.CreateSwapChainForHwnd")
+            self._limit_queued_frames()
         except WGCError as error:
             raise D3D11PresentationError(str(error)) from error
         finally:
             _release(factory)
             _release(adapter)
             _release(dxgi_device)
+
+    def _limit_queued_frames(self) -> None:
+        """Keep flip presentation from silently superseding queued frames.
+
+        The DXGI default permits several frames to queue ahead of scanout.  For
+        a generated-frame presenter that can make a short-lived intermediate
+        frame count as submitted even though a newer frame replaces it before
+        the compositor samples it.  A one-frame limit applies back-pressure at
+        Present, so the producer cannot run multiple visible frames ahead.
+        """
+
+        dxgi_device1 = ctypes.c_void_p()
+        try:
+            dxgi_device1 = _query_interface(
+                self._device,
+                _IID_IDXGI_DEVICE1,
+                "QueryInterface(IDXGIDevice1)",
+            )
+            result = _vtable_function(
+                dxgi_device1,
+                12,
+                ctypes.c_long,
+                wintypes.UINT,
+            )(dxgi_device1, 1)
+            _check_hresult(result, "IDXGIDevice1.SetMaximumFrameLatency(1)")
+        except WGCError as error:
+            raise D3D11PresentationError(str(error)) from error
+        finally:
+            _release(dxgi_device1)
 
     def _create_render_target(self) -> None:
         _release(self._back_buffer)
@@ -1166,7 +1198,7 @@ class D3D11SwapChainPresenter:
             raise D3D11PresentationError("Presenter is closed.")
         result = _vtable_function(
             self._swap_chain, 8, ctypes.c_long, wintypes.UINT, wintypes.UINT
-        )(self._swap_chain, 1 if self.vsync else 0, 0)
+        )(self._swap_chain, self.sync_interval if self.vsync else 0, 0)
         try:
             _check_hresult(result, "IDXGISwapChain.Present")
         except WGCError as error:

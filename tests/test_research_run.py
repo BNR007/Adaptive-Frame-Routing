@@ -179,6 +179,31 @@ def test_research_run_never_overwrites_existing_directory(tmp_path: Path) -> Non
         second.prepare()
 
 
+def test_presentmon_can_be_deferred_until_presenter_exists(
+    tmp_path: Path, monkeypatch
+) -> None:
+    clock = FakeClock()
+    spec = ResearchRunSpec(
+        root=tmp_path,
+        machine_id="m",
+        application="a",
+        scene_id="s",
+        condition="c",
+        repetition=1,
+    )
+    recorder = ResearchRunRecorder(
+        spec, project_root=tmp_path, clock=clock, resource_probe=FakeProbe()
+    )
+    recorder.prepare()
+    starts = []
+    monkeypatch.setattr(recorder, "_start_presentmon", lambda: starts.append(True))
+    recorder.begin_timing(sample_resources=False, start_presentmon=False)
+    assert starts == []
+    recorder.start_presentmon()
+    assert starts == [True]
+    recorder.close(status="interrupted")
+
+
 def test_output_analyzer_separates_calls_unique_and_meaningful_motion() -> None:
     analyzer = OutputFrameAnalyzer(motion_threshold=1.0)
     black = np.zeros((72, 128, 3), dtype=np.uint8)

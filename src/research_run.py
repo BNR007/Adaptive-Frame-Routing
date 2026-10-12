@@ -538,7 +538,12 @@ class ResearchRunRecorder:
         self._write_manifest(status="prepared")
         return self.run_directory
 
-    def begin_timing(self, *, sample_resources: bool = True) -> None:
+    def begin_timing(
+        self,
+        *,
+        sample_resources: bool = True,
+        start_presentmon: bool = True,
+    ) -> None:
         if self._frame_writer is None:
             raise RuntimeError("Research recorder must be prepared before timing begins.")
         if self._timing_started_at is not None:
@@ -548,7 +553,8 @@ class ResearchRunRecorder:
             self._timing_started_at + self.spec.warmup_seconds
         )
         self._write_manifest(status="warming_up")
-        self._start_presentmon()
+        if start_presentmon:
+            self._start_presentmon()
         if sample_resources:
             self._resource_thread = threading.Thread(
                 target=self._sample_resources,
@@ -556,6 +562,13 @@ class ResearchRunRecorder:
                 daemon=True,
             )
             self._resource_thread.start()
+
+    def start_presentmon(self) -> None:
+        """Start capture after the presentation swap chain has been created."""
+
+        if self._timing_started_at is None:
+            raise RuntimeError("Research timing must begin before PresentMon capture.")
+        self._start_presentmon()
 
     def phase(self, now: float | None = None) -> str:
         if self._timing_started_at is None:

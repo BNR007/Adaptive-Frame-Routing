@@ -12,6 +12,7 @@ import pytest
 import d3d11_gpu_pipeline
 import d3d11_shaders
 import wgc_capture
+from cpu_d3d11_presenter import D3D11CpuFramePresenter, RefreshCadence
 from d3d11_gpu_pipeline import (
     D3D11CapabilityError,
     D3D11PresentationError,
@@ -162,6 +163,36 @@ def test_presenter_resize_and_idempotent_close_state() -> None:
     assert state.closed is True
     with pytest.raises(D3D11PresentationError, match="closed"):
         state.request(1280, 720)
+
+
+@pytest.mark.parametrize(
+    ("refresh_hz", "target_fps", "expected"),
+    [(60, 60, 1), (75, 60, 1), (120, 60, 2), (144, 60, 2), (240, 60, 4)],
+)
+def test_cpu_presenter_matches_high_refresh_display_to_target(
+    refresh_hz: int, target_fps: float, expected: int
+) -> None:
+    assert (
+        D3D11CpuFramePresenter._sync_interval_for_target(refresh_hz, target_fps)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("refresh_hz", "target_fps", "expected"),
+    [
+        (60, 60, [1, 1, 1, 1, 1]),
+        (120, 60, [2, 2, 2, 2, 2]),
+        (144, 60, [2, 2, 3, 2, 3]),
+        (165, 60, [2, 3, 3, 3]),
+        (240, 60, [4, 4, 4, 4]),
+    ],
+)
+def test_refresh_cadence_maps_target_onto_integer_vblanks(
+    refresh_hz: int, target_fps: float, expected: list[int]
+) -> None:
+    cadence = RefreshCadence(refresh_hz, target_fps)
+    assert [cadence.next_interval() for _ in expected] == expected
 
 
 def test_gpu_metrics_report_cpu_side_distributions() -> None:

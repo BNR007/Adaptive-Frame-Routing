@@ -1407,7 +1407,11 @@ def run_application(
     if not shutdown_event.is_set():
         pipeline.start()
         if research_recorder is not None:
-            research_recorder.begin_timing()
+            research_recorder.begin_timing(
+                start_presentmon=(
+                    getattr(args, "preview_presenter", "opencv") != "d3d11"
+                )
+            )
         publish_state("running")
     counter_baseline_real = 0
     counter_baseline_generated = 0
@@ -1616,7 +1620,10 @@ def run_application(
                     )
                     if use_native_presenter and native_presenter is None:
                         native_presenter = D3D11CpuFramePresenter(
-                            frame.shape[1], frame.shape[0], vsync=True
+                            frame.shape[1],
+                            frame.shape[0],
+                            vsync=True,
+                            target_fps=float(args.target_fps or 60.0),
                         )
                         if (getattr(args, "preview_fullscreen", False)
                                 and selected_window is not None and capture.backend_name == "wgc"):
@@ -1627,10 +1634,16 @@ def run_application(
                                 preview_hwnd=native_presenter.hwnd,
                             )
                             logger.info(
-                                "D3D11 flip presenter enabled: click-through, vsync on; "
-                                "Alt-Tab hides output and Ctrl+Alt+Q stops."
+                                "D3D11 flip presenter enabled: click-through, vsync on, "
+                                "maximum queued frame latency 1, "
+                                "%d Hz display / refresh cadence %s; "
+                                "Alt-Tab hides output and Ctrl+Alt+Q stops.",
+                                native_presenter.refresh_hz,
+                                native_presenter.cadence_description,
                             )
                         preview_initialized = True
+                        if research_recorder is not None:
+                            research_recorder.start_presentmon()
                     if use_native_presenter:
                         native_presenter.present_bgr(frame)
                         if native_presenter.quit_requested:
