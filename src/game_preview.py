@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 
 
 class GamePreview:
-    def __init__(self, title, target_hwnd):
+    def __init__(self, title, target_hwnd, preview_hwnd=None):
         self.target = target_hwnd
-        self.hwnd = win32gui.FindWindow(None, title)
+        self.hwnd = preview_hwnd or win32gui.FindWindow(None, title)
         if not self.hwnd:
             raise RuntimeError("Preview window was not created.")
         style = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)

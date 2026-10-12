@@ -821,6 +821,7 @@ class D3D11SwapChainPresenter:
         self._device = _add_ref(device)
         self._context = _add_ref(context)
         self._swap_chain = ctypes.c_void_p()
+        self._back_buffer = ctypes.c_void_p()
         self._render_target_view = ctypes.c_void_p()
         self._size = PresenterSizeState(width, height)
         self.vsync = bool(vsync)
@@ -920,6 +921,12 @@ class D3D11SwapChainPresenter:
         if self._closed or not self._render_target_view.value:
             raise D3D11PresentationError("Swap-chain render target is unavailable.")
         return ctypes.c_void_p(self._render_target_view.value)
+
+    @property
+    def back_buffer(self) -> ctypes.c_void_p:
+        if self._closed or not self._back_buffer.value:
+            raise D3D11PresentationError("Swap-chain back buffer is unavailable.")
+        return ctypes.c_void_p(self._back_buffer.value)
 
     @property
     def output_size(self) -> tuple[int, int]:
@@ -1069,7 +1076,7 @@ class D3D11SwapChainPresenter:
             _release(dxgi_device)
 
     def _create_render_target(self) -> None:
-        back_buffer = ctypes.c_void_p()
+        _release(self._back_buffer)
         try:
             result = _vtable_function(
                 self._swap_chain,
@@ -1082,7 +1089,7 @@ class D3D11SwapChainPresenter:
                 self._swap_chain,
                 0,
                 ctypes.byref(_IID_D3D11_TEXTURE2D),
-                ctypes.byref(back_buffer),
+                ctypes.byref(self._back_buffer),
             )
             _check_hresult(result, "IDXGISwapChain.GetBuffer")
             result = _vtable_function(
@@ -1092,12 +1099,15 @@ class D3D11SwapChainPresenter:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_void_p),
-            )(self._device, back_buffer, None, ctypes.byref(self._render_target_view))
+            )(
+                self._device,
+                self._back_buffer,
+                None,
+                ctypes.byref(self._render_target_view),
+            )
             _check_hresult(result, "ID3D11Device.CreateRenderTargetView")
         except WGCError as error:
             raise D3D11PresentationError(str(error)) from error
-        finally:
-            _release(back_buffer)
 
     def pump_messages(self) -> None:
         message = _Msg()
@@ -1117,6 +1127,7 @@ class D3D11SwapChainPresenter:
         width, height = pending
         self._unbind_render_target()
         _release(self._render_target_view)
+        _release(self._back_buffer)
         result = _vtable_function(
             self._swap_chain,
             13,
@@ -1180,6 +1191,7 @@ class D3D11SwapChainPresenter:
         self._quit_requested = True
         self._unbind_render_target()
         _release(self._render_target_view)
+        _release(self._back_buffer)
         _release(self._swap_chain)
         if self._hwnd and self._user32.IsWindow(self._hwnd):
             self._user32.DestroyWindow(self._hwnd)

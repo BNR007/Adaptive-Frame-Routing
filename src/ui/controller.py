@@ -170,6 +170,7 @@ class RuntimeConfiguration:
         return SimpleNamespace(
             retune=False,
             no_preview=False,
+            preview_presenter="d3d11" if self.research_enabled else "opencv",
             preview_fullscreen=True,
             show_performance=True,
             draw_preview_overlay=self.show_performance_overlay,

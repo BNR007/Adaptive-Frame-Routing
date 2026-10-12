@@ -83,6 +83,7 @@ from window_capture import (
     select_window,
 )
 from visual_frame_marker import draw_visual_frame_marker
+from cpu_d3d11_presenter import D3D11CpuFramePresenter
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,12 @@ def parse_args() -> argparse.Namespace:
         "--no-preview",
         action="store_true",
         help="Run without cv2.imshow for controlled headless execution.",
+    )
+    parser.add_argument(
+        "--preview-presenter",
+        choices=("opencv", "d3d11"),
+        default="opencv",
+        help="Present CPU frames through OpenCV or a flip-model D3D11 swap chain.",
     )
     parser.add_argument(
         "--show-performance",
@@ -1406,6 +1413,7 @@ def run_application(
     counter_baseline_generated = 0
     counter_baseline_total = 0
     preview_initialized = False
+    native_presenter = None
     game_preview = None
     last_refinement_ms = 0.0
     last_research_status = None
@@ -1603,7 +1611,31 @@ def run_application(
                         draw_visual_frame_marker(frame, visual_marker_id)
 
                     preview_title = "UniversalUpscaler Preview"
-                    if not preview_initialized:
+                    use_native_presenter = (
+                        getattr(args, "preview_presenter", "opencv") == "d3d11"
+                    )
+                    if use_native_presenter and native_presenter is None:
+                        native_presenter = D3D11CpuFramePresenter(
+                            frame.shape[1], frame.shape[0], vsync=True
+                        )
+                        if (getattr(args, "preview_fullscreen", False)
+                                and selected_window is not None and capture.backend_name == "wgc"):
+                            from game_preview import GamePreview
+                            game_preview = GamePreview(
+                                preview_title,
+                                selected_window.hwnd,
+                                preview_hwnd=native_presenter.hwnd,
+                            )
+                            logger.info(
+                                "D3D11 flip presenter enabled: click-through, vsync on; "
+                                "Alt-Tab hides output and Ctrl+Alt+Q stops."
+                            )
+                        preview_initialized = True
+                    if use_native_presenter:
+                        native_presenter.present_bgr(frame)
+                        if native_presenter.quit_requested:
+                            quit_requested = True
+                    elif not preview_initialized:
                         cv2.namedWindow(preview_title, cv2.WINDOW_NORMAL)
                         cv2.imshow(preview_title, frame)
                         cv2.waitKey(1)
@@ -1619,7 +1651,7 @@ def run_application(
                             game_preview = GamePreview(preview_title, selected_window.hwnd)
                             logger.info("Game preview enabled: Alt-Tab hides output; Ctrl+Alt+Q stops.")
                         preview_initialized = True
-                    else:
+                    elif not use_native_presenter:
                         cv2.imshow(preview_title, frame)
                     submitted_at = time.perf_counter()
                     if current_visual_marker_id is not None:
@@ -1640,7 +1672,8 @@ def run_application(
                             logger, pacing_snapshot, output_snapshot,
                             last_output_analysis,
                         )
-                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                    if (not use_native_presenter
+                            and cv2.waitKey(1) & 0xFF in (ord("q"), 27)):
                         quit_requested = True
                         break
                 if quit_requested:
@@ -1669,6 +1702,8 @@ def run_application(
                 processing_close = getattr(processing_backend, "close", None)
                 if processing_close is not None:
                     processing_close()
+            if native_presenter is not None:
+                native_presenter.close()
             cv2.destroyAllWindows()
             recovery.mark_stopped()
             if research_recorder is not None:
