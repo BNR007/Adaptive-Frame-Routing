@@ -63,6 +63,7 @@ FRAME_FIELDS = (
     "source_frames_processed",
     "input_queue_replacements",
     "output_queue_replacements",
+    "stale_reserved_batches",
     "pipeline_generated_drops",
     "generated_deadline_drops",
     "stale_generated_drops",
@@ -603,6 +604,9 @@ class ResearchRunRecorder:
             "source_frames_processed": int(getattr(pipeline, "processed_frames", 0)),
             "input_queue_replacements": int(pipeline.input_replacements),
             "output_queue_replacements": int(pipeline.result_replacements),
+            "stale_reserved_batches": int(
+                getattr(pipeline, "stale_reserved_batches", 0)
+            ),
             "pipeline_generated_drops": int(pipeline.dropped_generated_frames),
             "generated_deadline_drops": int(
                 pacing_snapshot.generated_frames_dropped_late
@@ -666,6 +670,7 @@ class ResearchRunRecorder:
                 "source_frames_processed": measured_counters["source_frames_processed"],
                 "input_queue_replacements": measured_counters["input_queue_replacements"],
                 "output_queue_replacements": measured_counters["output_queue_replacements"],
+                "stale_reserved_batches": measured_counters["stale_reserved_batches"],
                 "pipeline_generated_drops": measured_counters["pipeline_generated_drops"],
                 "generated_deadline_drops": measured_counters["generated_deadline_drops"],
                 "stale_generated_drops": measured_counters["stale_generated_drops"],
@@ -921,6 +926,9 @@ class ResearchRunRecorder:
                 ),
                 "output_queue_replacements": self._last_int(
                     self._frame_rows, "output_queue_replacements"
+                ),
+                "stale_reserved_batches": self._last_int(
+                    self._frame_rows, "stale_reserved_batches"
                 ),
                 "pipeline_generated": self._last_int(
                     self._frame_rows, "pipeline_generated_drops"

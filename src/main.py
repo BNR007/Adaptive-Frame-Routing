@@ -1361,6 +1361,9 @@ def run_application(
         frame_interpolator=frame_interpolator,
         generated_frames=getattr(args, "generated_frames", 1),
         queue_depth=getattr(args, "queue_depth", 2),
+        output_max_age_ms=getattr(
+            args, "max_frame_latency_ms", DEFAULT_MAX_FRAME_LATENCY_MS
+        ),
         collect_telemetry=show_performance,
     )
     recovery.set_on_recovery(pipeline.clear_queued_frames)

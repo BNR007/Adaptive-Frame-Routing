@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import logging
+import math
 import threading
 import time
 import traceback
@@ -179,6 +180,7 @@ class AsyncFramePipeline:
         frame_interpolator: Any | None = None,
         generated_frames: int = 1,
         queue_depth: int = 2,
+        output_max_age_ms: float = 100.0,
         collect_telemetry: bool = False,
         clock: Callable[[], float] = time.perf_counter,
         worker_name: str = "frame-processing-worker",
@@ -192,12 +194,20 @@ class AsyncFramePipeline:
             raise TypeError("Generated frame count must be an integer.")
         if not 1 <= generated_frames <= 4:
             raise ValueError("Generated frame count must be between 1 and 4.")
+        if (
+            isinstance(output_max_age_ms, bool)
+            or not isinstance(output_max_age_ms, (int, float))
+            or not math.isfinite(float(output_max_age_ms))
+            or output_max_age_ms <= 0.0
+        ):
+            raise ValueError("Output maximum age must be positive.")
         self._processor = processor
         self._capture_source = capture_source
         self._capture_shutdown = capture_shutdown
         self._capture_shutdown_on_worker = bool(capture_shutdown_on_worker)
         self._frame_interpolator = frame_interpolator
         self.generated_frames = generated_frames
+        self.output_max_age_ms = float(output_max_age_ms)
         self._previous_processed_image: Any | None = None
         self._collect_telemetry = bool(collect_telemetry)
         self._clock = clock
@@ -212,6 +222,7 @@ class AsyncFramePipeline:
         self._processed_frames = 0
         self._result_replacements = 0
         self._dropped_generated_frames = 0
+        self._stale_reserved_batches = 0
         self._interpolated_frames = 0
         self._interpolation_failures = 0
         # Fractional 1/3 + 2/3 generation is allowed to prove that it fits the
@@ -262,6 +273,11 @@ class AsyncFramePipeline:
     def dropped_generated_frames(self) -> int:
         with self._result_condition:
             return self._dropped_generated_frames
+
+    @property
+    def stale_reserved_batches(self) -> int:
+        with self._result_condition:
+            return self._stale_reserved_batches
 
     @property
     def interpolated_frames(self) -> int:
@@ -387,18 +403,72 @@ class AsyncFramePipeline:
         self,
         timeout: float | None = 0.0,
     ) -> list[ProcessedFrame]:
-        """Consume one complete ordered presentation batch without polling."""
+        """Atomically consume one complete ordered presentation batch.
 
-        first = self.take_latest(timeout=timeout)
-        if first is None:
-            return []
-        results = [first]
-        while results[-1].frame_kind == "generated":
-            following = self.take_latest(timeout=0.0)
-            if following is None:
-                break
-            results.append(following)
+        The generated members and following real endpoint must be removed
+        under one condition lock.  Unlocking between individual dequeues lets
+        the producer replace the endpoint and can splice different source
+        intervals into one presentation batch.
+        """
+
+        self.raise_if_failed()
+        with self._result_condition:
+            if not self._presentation_results and timeout != 0.0:
+                self._result_condition.wait_for(
+                    lambda: (
+                        bool(self._presentation_results)
+                        or self._failure is not None
+                        or self._processing_finished
+                    ),
+                    timeout=timeout,
+                )
+            if not self._presentation_results:
+                results: list[ProcessedFrame] = []
+            else:
+                # A short presenter stall must not force a stale reserved real
+                # endpoint onto the screen before a newer complete batch.  If
+                # a successor exists, retire the whole expired batch together
+                # so temporal order cannot jump backward and then forward.
+                while self._presentation_results:
+                    queued = list(self._presentation_results)
+                    first_batch_end = self._complete_batch_length(queued)
+                    if first_batch_end >= len(queued):
+                        break
+                    endpoint = queued[first_batch_end - 1]
+                    age_ms = (self._clock() - endpoint.captured_at) * 1000.0
+                    if age_ms <= self.output_max_age_ms:
+                        break
+                    stale_batch = [
+                        self._presentation_results.popleft()
+                        for _ in range(first_batch_end)
+                    ]
+                    self._result_replacements += len(stale_batch)
+                    self._dropped_generated_frames += sum(
+                        result.frame_kind == "generated"
+                        for result in stale_batch
+                    )
+                    self._stale_reserved_batches += 1
+
+                results = []
+                while self._presentation_results:
+                    result = self._presentation_results.popleft()
+                    results.append(result)
+                    if result.frame_kind != "generated":
+                        break
+
+        self.raise_if_failed()
         return results
+
+    @staticmethod
+    def _complete_batch_length(results: list[ProcessedFrame]) -> int:
+        return next(
+            (
+                index + 1
+                for index, result in enumerate(results)
+                if result.frame_kind != "generated"
+            ),
+            len(results),
+        )
 
     def clear_queued_frames(self) -> int:
         """Clear stale input and presentation output during recovery."""
@@ -643,16 +713,45 @@ class AsyncFramePipeline:
         ]
 
     def _publish_results(self, results: list[ProcessedFrame]) -> None:
-        """Atomically replace stale output with one newest ordered presentation batch."""
+        """Publish bounded ordered batches without pre-empting a midpoint.
+
+        A generated frame and its following real frame form one presentation
+        batch.  Once such a batch reaches the output handoff it must get one
+        chance to reach the pacer; otherwise a newer worker result can erase
+        the midpoint before the presenter even evaluates its deadline.
+
+        Keep that oldest generated batch plus one newest successor.  Any
+        superseded successor is replaced atomically, so overload still cannot
+        grow into an unbounded FIFO queue.  Real-only output retains the
+        original newest-frame behaviour.
+        """
 
         with self._result_condition:
             if self._presentation_results:
-                self._result_replacements += len(self._presentation_results)
-                self._dropped_generated_frames += sum(
+                queued = list(self._presentation_results)
+                first_batch_end = self._complete_batch_length(queued)
+                reserved_batch = queued[:first_batch_end]
+                has_reserved_generated = any(
                     result.frame_kind == "generated"
-                    for result in self._presentation_results
+                    for result in reserved_batch
                 )
-                self._presentation_results.clear()
+
+                if has_reserved_generated:
+                    superseded = queued[first_batch_end:]
+                    if superseded:
+                        self._result_replacements += len(superseded)
+                        self._dropped_generated_frames += sum(
+                            result.frame_kind == "generated"
+                            for result in superseded
+                        )
+                        self._presentation_results.clear()
+                        self._presentation_results.extend(reserved_batch)
+                else:
+                    self._result_replacements += len(queued)
+                    self._dropped_generated_frames += sum(
+                        result.frame_kind == "generated" for result in queued
+                    )
+                    self._presentation_results.clear()
             self._presentation_results.extend(results)
             self._result_condition.notify_all()
 

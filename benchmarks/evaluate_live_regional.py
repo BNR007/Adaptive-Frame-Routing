@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--inference-width", type=int, default=160)
     parser.add_argument("--inference-height", type=int, default=90)
+    parser.add_argument("--source-width", type=int, default=0)
+    parser.add_argument("--source-height", type=int, default=0)
     parser.add_argument("--budget-ms", type=float, default=16.7)
     parser.add_argument("--samples", type=int, default=120)
     parser.add_argument("--stride", type=int, default=10)
@@ -58,6 +60,8 @@ def main() -> None:
     capture = cv2.VideoCapture(str(args.video))
     if not capture.isOpened():
         raise SystemExit(f"Unable to open video: {args.video}")
+    recorded_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    recorded_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, args.start_frame))
     interpolator = RIFEInterpolator(
         args.model,
@@ -84,6 +88,11 @@ def main() -> None:
             ok_last, last = capture.read()
             if not ok_target or not ok_last:
                 break
+            if args.source_width > 0 and args.source_height > 0:
+                size = (args.source_width, args.source_height)
+                first = cv2.resize(first, size, interpolation=cv2.INTER_AREA)
+                target = cv2.resize(target, size, interpolation=cv2.INTER_AREA)
+                last = cv2.resize(last, size, interpolation=cv2.INTER_AREA)
             if pair_index % args.stride == 0:
                 midpoint = cv2.addWeighted(first, 0.5, last, 0.5, 0.0)
                 started = time.perf_counter()
@@ -154,6 +163,8 @@ def main() -> None:
         "video": str(args.video.resolve()),
         "samples": len(rows),
         "budget_ms": args.budget_ms,
+        "source_width": int(args.source_width or recorded_width),
+        "source_height": int(args.source_height or recorded_height),
         "mean_processing_ms": statistics.mean(warm_times),
         "median_processing_ms": statistics.median(warm_times),
         "p95_processing_ms": percentile(warm_times, 0.95),

@@ -12,6 +12,7 @@ from async_pipeline import (
     CapturedFrame,
     LatestFrameHandoff,
     PipelineWorkerError,
+    ProcessedFrame,
 )
 from frame_interpolator import NoOpInterpolator
 
@@ -522,7 +523,7 @@ def test_rife_failure_immediately_falls_back_to_current_frame(caplog) -> None:
         pipeline.stop()
 
 
-def test_frame_generation_drops_stale_generated_output_as_one_new_batch() -> None:
+def test_frame_generation_reserves_one_generated_batch_and_keeps_newest_successor() -> None:
     interpolator = _MidpointInterpolator()
 
     class IdentityProcessor:
@@ -535,18 +536,138 @@ def test_frame_generation_drops_stale_generated_output_as_one_new_batch() -> Non
     )
     pipeline.start()
     try:
-        for index, frame in enumerate(("A", "B", "C"), start=1):
+        for index, frame in enumerate(("A", "B", "C", "D"), start=1):
             pipeline.submit(frame)
             _wait_for_processed_frames(pipeline, index)
 
         middle = pipeline.take_latest(timeout=1.0)
         current = pipeline.take_latest(timeout=1.0)
-        assert middle is not None and middle.image == "middle(B,C)"
-        assert current is not None and current.image == "C"
+        newest_middle = pipeline.take_latest(timeout=1.0)
+        newest_current = pipeline.take_latest(timeout=1.0)
+
+        # B's midpoint was already admitted to the output handoff, so C and D
+        # cannot erase it before the pacer gets one chance to present it.
+        assert middle is not None and middle.image == "middle(A,B)"
+        assert current is not None and current.image == "B"
+        # The single successor slot still uses newest-frame semantics: C's
+        # complete batch is replaced by D's complete batch.
+        assert newest_middle is not None and newest_middle.image == "middle(C,D)"
+        assert newest_current is not None and newest_current.image == "D"
         assert pipeline.result_replacements == 3
         assert pipeline.dropped_generated_frames == 1
     finally:
         pipeline.stop()
+
+
+def test_presentation_batch_dequeue_is_atomic_against_publisher() -> None:
+    """A producer cannot replace an endpoint after its midpoint was dequeued."""
+
+    interpolator = _MidpointInterpolator()
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=interpolator,
+    )
+    pipeline.start()
+    try:
+        pipeline.submit("A")
+        _wait_for_processed_frames(pipeline, 1)
+        assert pipeline.take_presentation_batch(timeout=1.0)[0].image == "A"
+
+        pipeline.submit("B")
+        _wait_for_processed_frames(pipeline, 2)
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+
+        assert [result.image for result in batch] == ["middle(A,B)", "B"]
+        assert len({result.sequence_id for result in batch}) == 1
+    finally:
+        pipeline.stop()
+
+
+def _presentation_result(sequence_id: int, kind: str, captured_at: float = 0.0):
+    return ProcessedFrame(
+        sequence_id=sequence_id,
+        image=f"{kind}-{sequence_id}",
+        captured_at=captured_at,
+        processing_started_at=captured_at,
+        processed_at=captured_at,
+        capture_ms=0.0,
+        frame_kind=kind,
+    )
+
+
+@pytest.mark.parametrize("generated_count", (1, 2, 3, 4))
+def test_output_handoff_is_bounded_and_preserves_batch_sequence_integrity(
+    generated_count: int,
+) -> None:
+    pipeline = AsyncFramePipeline(
+        object(), generated_frames=generated_count, clock=lambda: 0.0
+    )
+
+    for sequence_id in range(100):
+        pipeline._publish_results([
+            *(
+                _presentation_result(sequence_id, "generated")
+                for _ in range(generated_count)
+            ),
+            _presentation_result(sequence_id, "processed"),
+        ])
+        assert pipeline.queue_sizes().output <= 2 * (generated_count + 1)
+
+    oldest = pipeline.take_presentation_batch()
+    newest = pipeline.take_presentation_batch()
+    assert {result.sequence_id for result in oldest} == {0}
+    assert {result.sequence_id for result in newest} == {99}
+    assert pipeline.result_replacements == 98 * (generated_count + 1)
+    assert pipeline.dropped_generated_frames == 98 * generated_count
+
+
+def test_stalled_consumer_discards_whole_stale_reserved_batch() -> None:
+    now = [0.0]
+    pipeline = AsyncFramePipeline(
+        object(),
+        output_max_age_ms=50.0,
+        clock=lambda: now[0],
+    )
+    pipeline._publish_results([
+        _presentation_result(1, "generated", captured_at=0.0),
+        _presentation_result(1, "processed", captured_at=0.0),
+    ])
+    pipeline._publish_results([
+        _presentation_result(2, "generated", captured_at=0.09),
+        _presentation_result(2, "processed", captured_at=0.09),
+    ])
+
+    now[0] = 0.10
+    selected = pipeline.take_presentation_batch()
+
+    assert {result.sequence_id for result in selected} == {2}
+    assert pipeline.stale_reserved_batches == 1
+    assert pipeline.result_replacements == 2
+    assert pipeline.dropped_generated_frames == 1
+
+
+def test_real_only_output_retains_newest_frame_semantics() -> None:
+    pipeline = AsyncFramePipeline(object())
+    for sequence_id in range(100):
+        pipeline._publish_results([
+            _presentation_result(sequence_id, "processed")
+        ])
+
+    selected = pipeline.take_presentation_batch()
+    assert [result.sequence_id for result in selected] == [99]
+    assert pipeline.result_replacements == 99
+    assert pipeline.dropped_generated_frames == 0
+
+
+@pytest.mark.parametrize("invalid", (True, 0, -1, float("nan"), float("inf"), "100"))
+def test_output_max_age_rejects_invalid_values(invalid) -> None:
+    with pytest.raises(ValueError, match="maximum age"):
+        AsyncFramePipeline(object(), output_max_age_ms=invalid)
 
 
 def test_frame_generation_shutdown_releases_workers_and_previous_frame() -> None:
