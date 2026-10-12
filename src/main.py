@@ -39,6 +39,7 @@ from frame_interpolator import (
     RIFEInterpolatorError,
 )
 from frame_pacing import (
+    BufferedPlayoutQueue,
     DEFAULT_MAX_FRAME_LATENCY_MS,
     FramePacer,
     PresentationFrame,
@@ -229,6 +230,15 @@ def parse_args() -> argparse.Namespace:
         choices=(1, 2, 3, 4),
         default=1,
         help="Generate this many RIFE frames between consecutive real frames.",
+    )
+    parser.add_argument(
+        "--buffered-playout",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the experimental bounded playout reservoir with one midpoint "
+            "and one cheap reserve candidate. Requires --generated-frames 2."
+        ),
     )
     parser.add_argument(
         "--temporal-stabilization",
@@ -482,6 +492,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--ai-device-id must be zero or greater.")
     if args.rife_device_id is not None and args.rife_device_id < 0:
         parser.error("--rife-device-id must be zero or greater.")
+    if args.buffered_playout and args.generated_frames != 2:
+        parser.error("--buffered-playout requires --generated-frames 2.")
     if args.ai_tile_size is not None and args.ai_tile_size <= 0:
         parser.error("--ai-tile-size must be greater than zero.")
     if args.ai_tile_overlap < 0:
@@ -757,6 +769,7 @@ def _create_frame_interpolator(
     provider: str,
     device_id: int,
     generated_frames: int = 1,
+    buffered_playout: bool = False,
     inference_width: int | None = None,
     inference_height: int | None = None,
     model_path: Path | None = None,
@@ -775,7 +788,9 @@ def _create_frame_interpolator(
         # at 1/3 and 2/3. The checked-in two-input RIFE exports cannot accept a
         # timestep, so requiring DirectML here is both misleading and can stop
         # a valid 2x run when DirectML is unavailable or silently falls back.
-        effective_provider = "cpu" if generated_frames == 2 else provider
+        effective_provider = (
+            "cpu" if generated_frames == 2 and not buffered_playout else provider
+        )
         inference_options = {}
         if inference_width is not None or inference_height is not None:
             inference_options = {
@@ -1236,6 +1251,7 @@ def run_application(
             inference_height=getattr(args, "rife_input_height", None),
             model_path=getattr(args, "rife_model", None),
             generated_frames=getattr(args, "generated_frames", 1),
+            buffered_playout=bool(getattr(args, "buffered_playout", False)),
             temporal_stabilization=getattr(args, "temporal_stabilization", True),
             regional_transform=getattr(args, "regional_transform", False),
             regional_budget_ms=getattr(args, "regional_budget_ms", None),
@@ -1305,6 +1321,11 @@ def run_application(
             ", ".join(getattr(frame_interpolator, "active_providers", ()))
             or "no execution provider",
         )
+        if bool(getattr(args, "buffered_playout", False)):
+            logger.info(
+                "Buffered playout enabled: midpoint plus optional 3/4 candidate; "
+                "three-frame startup reservoir, four-frame hard bound."
+            )
 
     research_recorder = None
     if bool(getattr(args, "research_run", False)):
@@ -1378,13 +1399,25 @@ def run_application(
         capture_shutdown_on_worker=thread_bound_capture,
         frame_interpolator=frame_interpolator,
         generated_frames=getattr(args, "generated_frames", 1),
+        buffered_playout=bool(getattr(args, "buffered_playout", False)),
         queue_depth=getattr(args, "queue_depth", 2),
         output_max_age_ms=getattr(
             args, "max_frame_latency_ms", DEFAULT_MAX_FRAME_LATENCY_MS
         ),
         collect_telemetry=show_performance,
     )
-    recovery.set_on_recovery(pipeline.clear_queued_frames)
+    buffered_playout = (
+        BufferedPlayoutQueue()
+        if bool(getattr(args, "buffered_playout", False))
+        else None
+    )
+
+    def clear_runtime_queues() -> None:
+        pipeline.clear_queued_frames()
+        if buffered_playout is not None:
+            buffered_playout.clear()
+
+    recovery.set_on_recovery(clear_runtime_queues)
     recovery.mark_running()
     warmup_seconds = float(getattr(args, "warmup_seconds", 0.0))
     if warmup_seconds > 0.0:
@@ -1431,7 +1464,6 @@ def run_application(
     output_analyzer = OutputFrameAnalyzer() if research_recorder is not None else None
     last_output_analysis: dict = {}
     visual_marker_id = 0
-
     try:
         try:
             while True:
@@ -1457,11 +1489,28 @@ def run_application(
                 if game_preview is not None:
                     if game_preview.stop_requested() or not game_preview.update():
                         break
-                processed_batch = pipeline.take_presentation_batch(timeout=0.1)
+                timeout = 0.0 if buffered_playout is not None and buffered_playout.ready else 0.1
+                processed_batch = pipeline.take_presentation_batch(timeout=timeout)
+                if buffered_playout is not None:
+                    if processed_batch:
+                        buffered_playout.add_batch(processed_batch)
+                    while True:
+                        additional_batch = pipeline.take_presentation_batch(timeout=0.0)
+                        if not additional_batch:
+                            break
+                        buffered_playout.add_batch(additional_batch)
+                    next_frame = buffered_playout.pop_next()
+                    processed_batch = [] if next_frame is None else [next_frame]
                 if not processed_batch:
                     if pipeline.finished:
-                        break
-                    continue
+                        if buffered_playout is not None and buffered_playout.depth:
+                            buffered_playout.release_tail()
+                            tail_frame = buffered_playout.pop_next()
+                            processed_batch = [] if tail_frame is None else [tail_frame]
+                        if not processed_batch:
+                            break
+                    else:
+                        continue
                 pacing_decisions = pacer.iter_pace_batch(
                     PresentationFrame(
                         processed_frame,
@@ -1536,6 +1585,15 @@ def run_application(
                         if metrics.maybe_log(logger, now=presented_at):
                             log_effective_output = True
                             logger.info("Preview refinement: previous sample %.2f ms", last_refinement_ms)
+                            if buffered_playout is not None:
+                                logger.info(
+                                    "Buffered playout: depth %d/%d | optional reserve drops %d | "
+                                    "midpoint drops %d",
+                                    buffered_playout.depth,
+                                    buffered_playout.maximum_frames,
+                                    buffered_playout.dropped_optional_candidates,
+                                    buffered_playout.dropped_midpoint_candidates,
+                                )
                             if processed_frame.regional_provenance_counts:
                                 logger.info(
                                     "Regional provenance: %s | routes: %s | admission: %s",
@@ -1560,6 +1618,7 @@ def run_application(
                                 pacing_snapshot=pacing_snapshot,
                                 recovery_snapshot=recovery_snapshot,
                                 pipeline=pipeline,
+                                playout_queue=buffered_playout,
                                 output_analysis=last_output_analysis,
                                 submitted_at=presented_at,
                             )
@@ -1681,6 +1740,7 @@ def run_application(
                             pacing_snapshot=pacing_snapshot,
                             recovery_snapshot=recovery_snapshot,
                             pipeline=pipeline,
+                            playout_queue=buffered_playout,
                             output_analysis=last_output_analysis,
                             submitted_at=submitted_at,
                             visual_marker_id=current_visual_marker_id,

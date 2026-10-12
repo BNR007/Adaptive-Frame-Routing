@@ -15,9 +15,21 @@
 
 ## Overview
 
-UniversalUpscaler captures a selected Windows application, processes its frames through configurable spatial or AI upscaling, optionally generates intermediate RIFE or IFRNet frames, and presents the enhanced output with low-latency pacing.
+Adaptive Frame Routing captures a selected Windows application, classifies
+regions by motion and reliability, applies the most useful transformation that
+fits the current deadline, and presents a provenance-traceable output. It is a
+research platform for testing when external frame generation helps and when a
+stable real-frame fallback is safer.
+
+The central research question and the boundary between original work and
+third-party components are documented in
+[`docs/IRIS_RESEARCH_FRAMING.md`](docs/IRIS_RESEARCH_FRAMING.md).
 
 The clickable GUI provides target-window selection, WGC capture, CPU or experimental D3D11 rendering, spatial and ONNX AI processing, DirectML support, RIFE frame generation, runtime tuning, profiles, and performance counters.
+
+**Naming:** Adaptive Frame Routing is the research project and repository.
+`UniversalUpscaler` remains only as the legacy executable/configuration name
+while compatibility is preserved.
 
 ## Install and launch from source
 
@@ -56,6 +68,11 @@ The generated amount is the number of generated frames inserted for every real f
 The Start button counts down from five before capture begins, giving you time to switch to the target. The processed preview then opens fullscreen. The optional preview overlay contains only `real / generated`; for example, `30 / 120` means 30 real frames and 120 generated frames were actually presented. Detailed timing and dropped-frame diagnostics remain available in the expandable Status area.
 
 The first real frame establishes interpolation history, so a short finite session has one fewer generated interval than its real-frame count. Selecting 60 FPS is a pacing target, not a guarantee that the hardware can calculate 60 frames per second.
+
+The **IRIS Buffered Playout 720p30** research profile is a separate ablation.
+Its `2` setting means one normal midpoint plus one inexpensive 0.75 endpoint
+blend held as a jitter-concealment candidate. It does not perform two neural
+inferences and must not be reported as true 3x temporal reconstruction.
 
 Temporal stabilization is enabled by default in the GUI. Effectively duplicate
 frame pairs bypass model inference, nearly stationary regions retain stable real

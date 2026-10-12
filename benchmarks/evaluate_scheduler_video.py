@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from async_pipeline import AsyncFramePipeline
 from frame_interpolator import RIFEInterpolator
-from frame_pacing import FramePacer, PresentationFrame
+from frame_pacing import BufferedPlayoutQueue, FramePacer, PresentationFrame
 
 
 class IdentityProcessor:
@@ -51,6 +51,9 @@ class MidpointInterpolator:
         )
         self.last_total_ms = (time.perf_counter() - started) * 1000.0
         return result
+
+    def interpolate_at(self, frame_a, frame_b, timestep: float):
+        return self.interpolate(frame_a, frame_b, timestep)
 
     def shutdown(self) -> None:
         return None
@@ -98,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated presenter stalls injected once per second.",
     )
     parser.add_argument(
+        "--source-jitter-ms",
+        default="0",
+        help="Comma-separated source-delivery stalls injected once per second.",
+    )
+    parser.add_argument(
         "--output-directory",
         type=Path,
         default=PROJECT_ROOT / "output" / "scheduler_video_evaluation",
@@ -113,7 +121,10 @@ def percentile(values: list[float], fraction: float) -> float:
 
 
 def run_condition(
-    args: argparse.Namespace, policy: str, stall_ms: float
+    args: argparse.Namespace,
+    policy: str,
+    stall_ms: float,
+    source_jitter_ms: float,
 ) -> dict[str, object]:
     capture = cv2.VideoCapture(str(args.video))
     if not capture.isOpened():
@@ -139,12 +150,15 @@ def run_condition(
     pipeline_type = (
         LegacyReplacementPipeline if policy == "legacy_replace_all" else AsyncFramePipeline
     )
+    buffered = policy == "buffered_reserve_candidate"
     pipeline = pipeline_type(
         IdentityProcessor(),
         frame_interpolator=interpolator,
-        generated_frames=1,
+        generated_frames=2 if buffered else 1,
+        buffered_playout=buffered,
         queue_depth=2,
     )
+    playout_queue = BufferedPlayoutQueue() if buffered else None
     pacer = FramePacer(
         mode="fixed",
         target_fps=args.target_fps,
@@ -157,6 +171,7 @@ def run_condition(
     def produce() -> None:
         next_submit = time.perf_counter()
         submitted = 0
+        next_source_stall_at = round(args.source_fps)
         try:
             while submitted < round(args.duration * args.source_fps):
                 ok, frame = capture.read()
@@ -175,6 +190,12 @@ def run_condition(
                     time.sleep(delay)
                 pipeline.submit(frame)
                 submitted += 1
+                if (
+                    source_jitter_ms > 0.0
+                    and submitted >= next_source_stall_at
+                ):
+                    time.sleep(source_jitter_ms / 1000.0)
+                    next_source_stall_at += round(args.source_fps)
                 next_submit += 1.0 / args.source_fps
         except BaseException as error:  # benchmark must report worker failures
             producer_error.append(repr(error))
@@ -188,12 +209,41 @@ def run_condition(
     presented_kinds: list[str] = []
     presentation_times: list[float] = []
     sequence_ids: list[int] = []
+    generation_positions: list[float] = []
+    frame_ages_ms: list[float] = []
+    playout_depths: list[int] = []
+    playout_depths_before_pop: list[int] = []
     max_output_queue = 0
     next_stall_at = round(args.target_fps)
     try:
         while True:
             max_output_queue = max(max_output_queue, pipeline.queue_sizes().output)
-            batch = pipeline.take_presentation_batch(timeout=0.05)
+            batch = pipeline.take_presentation_batch(
+                timeout=0.0 if playout_queue is not None and playout_queue.ready else 0.05
+            )
+            if playout_queue is not None:
+                if batch:
+                    playout_queue.add_batch(batch)
+                while True:
+                    additional = pipeline.take_presentation_batch(timeout=0.0)
+                    if not additional:
+                        break
+                    playout_queue.add_batch(additional)
+                candidate = playout_queue.pop_next()
+                sizes_now = pipeline.queue_sizes()
+                producer_drained = (
+                    producer_done.is_set()
+                    and pipeline.processed_frames + pipeline.input_replacements
+                    >= pipeline.submitted_frames
+                    and sizes_now.input == 0
+                    and sizes_now.output == 0
+                )
+                if candidate is None and producer_drained and playout_queue.depth:
+                    playout_queue.release_tail()
+                    candidate = playout_queue.pop_next()
+                batch = [] if candidate is None else [candidate]
+                playout_depths.append(playout_queue.depth)
+                playout_depths_before_pop.append(playout_queue.last_depth_before_pop)
             for decision in pacer.iter_pace_batch(
                 PresentationFrame(
                     result,
@@ -210,6 +260,12 @@ def run_condition(
                 presented_kinds.append(decision.frame.frame_kind)
                 presentation_times.append(time.perf_counter())
                 sequence_ids.append(decision.frame.source_sequence_id)
+                generation_positions.append(
+                    float(getattr(decision.frame.payload, "generation_position", 1.0))
+                )
+                frame_ages_ms.append(
+                    (presentation_times[-1] - decision.frame.captured_at) * 1000.0
+                )
                 if stall_ms > 0.0 and len(presented_kinds) >= next_stall_at:
                     time.sleep(stall_ms / 1000.0)
                     next_stall_at += round(args.target_fps)
@@ -223,6 +279,10 @@ def run_condition(
                 )
                 and sizes.input == 0
                 and sizes.output == 0
+                and (
+                    playout_queue is None
+                    or playout_queue.depth == 0
+                )
             ):
                 break
     finally:
@@ -248,11 +308,20 @@ def run_condition(
     return {
         "policy": policy,
         "injected_stall_ms": stall_ms,
+        "injected_source_jitter_ms": source_jitter_ms,
         "elapsed_seconds": elapsed,
         "submitted_real_frames": pipeline.submitted_frames,
         "processed_real_frames": pipeline.processed_frames,
         "presented_real_frames": presented_kinds.count("processed"),
         "presented_generated_frames": presented_kinds.count("generated"),
+        "presented_midpoint_candidates": sum(
+            kind == "generated" and abs(position - 0.5) < 1e-6
+            for kind, position in zip(presented_kinds, generation_positions)
+        ),
+        "presented_reserve_candidates": sum(
+            kind == "generated" and position > 0.5 + 1e-6
+            for kind, position in zip(presented_kinds, generation_positions)
+        ),
         "paired_generated_frames": paired_generated,
         "software_presentation_fps": (
             (len(presentation_times) - 1)
@@ -263,11 +332,30 @@ def run_condition(
         "median_interval_ms": statistics.median(intervals_ms) if intervals_ms else 0.0,
         "p95_interval_ms": percentile(intervals_ms, 0.95),
         "p99_interval_ms": percentile(intervals_ms, 0.99),
+        "median_frame_age_ms": statistics.median(frame_ages_ms) if frame_ages_ms else 0.0,
+        "p95_frame_age_ms": percentile(frame_ages_ms, 0.95),
         "input_queue_replacements": pipeline.input_replacements,
         "output_queue_replacements": pipeline.result_replacements,
         "pipeline_generated_drops": pipeline.dropped_generated_frames,
         "stale_reserved_batches": pipeline.stale_reserved_batches,
         "max_output_queue_frames": max_output_queue,
+        "playout_optional_drops": (
+            0 if playout_queue is None else playout_queue.dropped_optional_candidates
+        ),
+        "playout_midpoint_drops": (
+            0 if playout_queue is None else playout_queue.dropped_midpoint_candidates
+        ),
+        "median_playout_depth": (
+            statistics.median(playout_depths) if playout_depths else 0.0
+        ),
+        "max_playout_depth": max(playout_depths, default=0),
+        "max_playout_depth_before_pop": max(playout_depths_before_pop, default=0),
+        "playout_startup_waits": (
+            0 if playout_queue is None else playout_queue.startup_waits
+        ),
+        "playout_empty_pops": (
+            0 if playout_queue is None else playout_queue.empty_pops
+        ),
         "pacer_generated_drops": snapshot.generated_frames_dropped_late,
         "pacer_real_drops": snapshot.real_frames_dropped_late,
         "cadence_misses": snapshot.cadence_misses,
@@ -282,10 +370,18 @@ def main() -> None:
         raise SystemExit(f"Model does not exist: {args.model}")
     args.output_directory.mkdir(parents=True, exist_ok=True)
     stalls = [float(value) for value in args.stalls_ms.split(",") if value.strip()]
+    source_jitters = [
+        float(value) for value in args.source_jitter_ms.split(",") if value.strip()
+    ]
     results = [
-        run_condition(args, policy, stall_ms)
+        run_condition(args, policy, stall_ms, source_jitter_ms)
         for stall_ms in stalls
-        for policy in ("legacy_replace_all", "reserved_generated_batch")
+        for source_jitter_ms in source_jitters
+        for policy in (
+            "legacy_replace_all",
+            "reserved_generated_batch",
+            "buffered_reserve_candidate",
+        )
     ]
     report = {
         "video": str(args.video.resolve()),

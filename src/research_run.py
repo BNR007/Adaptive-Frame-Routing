@@ -42,6 +42,7 @@ FRAME_FIELDS = (
     "interpolation_provider",
     "frame_generation",
     "captured_at",
+    "content_timestamp",
     "processing_started_at",
     "processed_at",
     "scheduled_at",
@@ -50,6 +51,7 @@ FRAME_FIELDS = (
     "processing_ms",
     "interpolation_ms",
     "frame_age_ms",
+    "content_age_ms",
     "capture_to_submission_ms",
     "pacing_error_ms",
     "estimated_source_fps",
@@ -65,6 +67,13 @@ FRAME_FIELDS = (
     "input_queue_replacements",
     "output_queue_replacements",
     "stale_reserved_batches",
+    "playout_buffer_depth",
+    "playout_depth_before_pop",
+    "playout_depth_after_pop",
+    "playout_startup_waits",
+    "playout_empty_pops",
+    "playout_optional_drops",
+    "playout_midpoint_drops",
     "pipeline_generated_drops",
     "generated_deadline_drops",
     "stale_generated_drops",
@@ -89,6 +98,7 @@ FRAME_FIELDS = (
     "provenance_reused",
     "provenance_deadline_fallback",
     "provenance_admission_fallback",
+    "provenance_reserve_blend",
 )
 
 RESOURCE_FIELDS = (
@@ -122,6 +132,7 @@ _PROVENANCE_FIELDS = {
     "reused": "provenance_reused",
     "deadline_fallback": "provenance_deadline_fallback",
     "admission_fallback": "provenance_admission_fallback",
+    "reserve_blend": "provenance_reserve_blend",
 }
 
 
@@ -602,6 +613,7 @@ class ResearchRunRecorder:
         pacing_snapshot: Any,
         recovery_snapshot: Any,
         pipeline: Any,
+        playout_queue: Any | None = None,
         output_analysis: Mapping[str, Any] | None = None,
         submitted_at: float | None = None,
         visual_marker_id: int | None = None,
@@ -622,6 +634,14 @@ class ResearchRunRecorder:
             "stale_reserved_batches": int(
                 getattr(pipeline, "stale_reserved_batches", 0)
             ),
+            "playout_optional_drops": int(
+                getattr(playout_queue, "dropped_optional_candidates", 0)
+            ),
+            "playout_midpoint_drops": int(
+                getattr(playout_queue, "dropped_midpoint_candidates", 0)
+            ),
+            "playout_startup_waits": int(getattr(playout_queue, "startup_waits", 0)),
+            "playout_empty_pops": int(getattr(playout_queue, "empty_pops", 0)),
             "pipeline_generated_drops": int(pipeline.dropped_generated_frames),
             "generated_deadline_drops": int(
                 pacing_snapshot.generated_frames_dropped_late
@@ -662,6 +682,11 @@ class ResearchRunRecorder:
                 "interpolation_provider": processed_frame.interpolation_provider,
                 "frame_generation": processed_frame.frame_generation,
                 "captured_at": processed_frame.captured_at,
+                "content_timestamp": (
+                    processed_frame.captured_at
+                    if getattr(processed_frame, "content_timestamp", None) is None
+                    else processed_frame.content_timestamp
+                ),
                 "processing_started_at": processed_frame.processing_started_at,
                 "processed_at": processed_frame.processed_at,
                 "scheduled_at": decision.scheduled_at,
@@ -670,6 +695,14 @@ class ResearchRunRecorder:
                 "processing_ms": processed_frame.processing_ms,
                 "interpolation_ms": processed_frame.interpolation_ms,
                 "frame_age_ms": (now - processed_frame.captured_at) * 1000.0,
+                "content_age_ms": (
+                    now
+                    - (
+                        processed_frame.captured_at
+                        if getattr(processed_frame, "content_timestamp", None) is None
+                        else processed_frame.content_timestamp
+                    )
+                ) * 1000.0,
                 "capture_to_submission_ms": (now - processed_frame.captured_at) * 1000.0,
                 "pacing_error_ms": decision.pacing_error_ms,
                 "estimated_source_fps": pacing_snapshot.estimated_source_fps,
@@ -687,6 +720,17 @@ class ResearchRunRecorder:
                 "input_queue_replacements": measured_counters["input_queue_replacements"],
                 "output_queue_replacements": measured_counters["output_queue_replacements"],
                 "stale_reserved_batches": measured_counters["stale_reserved_batches"],
+                "playout_buffer_depth": int(getattr(playout_queue, "depth", 0)),
+                "playout_depth_before_pop": int(
+                    getattr(playout_queue, "last_depth_before_pop", 0)
+                ),
+                "playout_depth_after_pop": int(
+                    getattr(playout_queue, "last_depth_after_pop", 0)
+                ),
+                "playout_optional_drops": measured_counters["playout_optional_drops"],
+                "playout_midpoint_drops": measured_counters["playout_midpoint_drops"],
+                "playout_startup_waits": measured_counters["playout_startup_waits"],
+                "playout_empty_pops": measured_counters["playout_empty_pops"],
                 "pipeline_generated_drops": measured_counters["pipeline_generated_drops"],
                 "generated_deadline_drops": measured_counters["generated_deadline_drops"],
                 "stale_generated_drops": measured_counters["stale_generated_drops"],
@@ -929,6 +973,9 @@ class ResearchRunRecorder:
             "frame_age_ms": _distribution(
                 self._numeric(self._frame_rows, "frame_age_ms")
             ),
+            "content_age_ms": _distribution(
+                self._numeric(self._frame_rows, "content_age_ms")
+            ),
             "capture_ms": _distribution(self._numeric(self._frame_rows, "capture_ms")),
             "processing_ms": _distribution(
                 self._numeric(self._frame_rows, "processing_ms")
@@ -946,6 +993,18 @@ class ResearchRunRecorder:
                 "stale_reserved_batches": self._last_int(
                     self._frame_rows, "stale_reserved_batches"
                 ),
+                "playout_optional_candidates": self._last_int(
+                    self._frame_rows, "playout_optional_drops"
+                ),
+                "playout_midpoint_candidates": self._last_int(
+                    self._frame_rows, "playout_midpoint_drops"
+                ),
+                "playout_startup_waits": self._last_int(
+                    self._frame_rows, "playout_startup_waits"
+                ),
+                "playout_empty_pops": self._last_int(
+                    self._frame_rows, "playout_empty_pops"
+                ),
                 "pipeline_generated": self._last_int(
                     self._frame_rows, "pipeline_generated_drops"
                 ),
@@ -959,6 +1018,15 @@ class ResearchRunRecorder:
                     self._frame_rows, "real_deadline_drops"
                 ),
             },
+            "playout_buffer_depth": _distribution(
+                self._numeric(self._frame_rows, "playout_buffer_depth")
+            ),
+            "playout_depth_before_pop": _distribution(
+                self._numeric(self._frame_rows, "playout_depth_before_pop")
+            ),
+            "playout_depth_after_pop": _distribution(
+                self._numeric(self._frame_rows, "playout_depth_after_pop")
+            ),
             "recoveries": {
                 "attempts": self._last_int(self._frame_rows, "recovery_attempts"),
                 "successful": self._last_int(

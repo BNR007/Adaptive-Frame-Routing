@@ -133,6 +133,11 @@ def test_research_run_records_only_measurement_and_summarizes(tmp_path: Path) ->
         pacing_snapshot=pacing(3.0, generated_drops=2),
         recovery_snapshot=recovery(),
         pipeline=pipeline(input_replacements=5),
+        playout_queue=SimpleNamespace(
+            depth=3,
+            dropped_optional_candidates=2,
+            dropped_midpoint_candidates=0,
+        ),
         visual_marker_id=7,
     )
     assert recorder.record_frame(
@@ -141,6 +146,11 @@ def test_research_run_records_only_measurement_and_summarizes(tmp_path: Path) ->
         pacing_snapshot=pacing(4.0, generated_drops=3),
         recovery_snapshot=recovery(),
         pipeline=pipeline(input_replacements=7),
+        playout_queue=SimpleNamespace(
+            depth=2,
+            dropped_optional_candidates=4,
+            dropped_midpoint_candidates=1,
+        ),
     )
     summary = recorder.close()
 
@@ -148,6 +158,9 @@ def test_research_run_records_only_measurement_and_summarizes(tmp_path: Path) ->
     assert summary["presented_frame_counts"] == {"generated": 1, "real": 1}
     assert summary["drops"]["input_queue_replacements"] == 2
     assert summary["drops"]["generated_deadline"] == 1
+    assert summary["drops"]["playout_optional_candidates"] == 2
+    assert summary["drops"]["playout_midpoint_candidates"] == 1
+    assert summary["playout_buffer_depth"]["median"] == 2.5
     assert summary["capture_to_submission_ms"]["p99"] is not None
     assert summary["regional_provenance_counts"]["interpolated"] == 5
     assert (run_directory / "manifest.json").is_file()

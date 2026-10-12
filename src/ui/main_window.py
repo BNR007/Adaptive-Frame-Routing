@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
                 ("capture_presentation", "B · Capture / presentation"),
                 ("whole_frame_fg", "C · Whole-frame FG"),
                 ("adaptive_routing", "D · Adaptive routing"),
+                ("adaptive_routing_buffered", "D2 · Buffered adaptive routing"),
             ),
             "Research condition",
         )
@@ -1360,6 +1361,7 @@ class MainWindow(QMainWindow):
             upscaling_method=str(self.method_combo.currentData() or "bilinear"),
             frame_generation=self.frame_generation_control.value(),
             generated_frames=int(self.generated_frames_combo.currentData() or 1),
+            buffered_playout=self.settings.buffered_playout,
             rife_model_path=Path(self.rife_model_combo.currentData() or RIFE_MODEL),
             warmup_seconds=5.0,
             preset=str(self.preset_combo.currentData()),

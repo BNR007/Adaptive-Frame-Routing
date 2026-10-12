@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from async_pipeline import (
@@ -435,6 +437,107 @@ def test_two_generated_frames_use_uniform_third_and_two_third_positions():
         assert interpolator.positions == pytest.approx([1.0 / 3.0, 2.0 / 3.0])
         assert batch[0].interpolation_provider == "OpenCV regional/flow CPU"
         assert batch[0].generation_method == "farneback_flow"
+    finally:
+        pipeline.stop()
+
+
+def test_buffered_two_candidate_mode_keeps_midpoint_and_adds_late_reserve():
+    class FractionalInterpolator(_MidpointInterpolator):
+        last_generation_method = "buffered_candidates"
+
+        def interpolate_at(self, frame_a, frame_b, position):
+            return f"reserve({position:.2f})"
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=FractionalInterpolator(),
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    pipeline.start()
+    try:
+        pipeline.submit("A")
+        assert pipeline.take_latest(timeout=1.0).image == "A"
+        pipeline.submit("B")
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert [item.generation_position for item in batch] == pytest.approx(
+            [0.5, 0.75, 1.0]
+        )
+        assert batch[0].image == "middle(A,B)"
+        assert batch[1].image == "reserve(0.75)"
+        assert batch[2].image == "B"
+    finally:
+        pipeline.stop()
+
+
+def test_buffered_reserve_uses_one_model_call_for_image_frames():
+    class CountingInterpolator:
+        produces_intermediate_frame = True
+        active_providers = ("test",)
+        last_generation_method = "counting"
+        last_total_ms = 0.0
+        last_regional_result = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def interpolate(self, frame_a, frame_b):
+            self.calls += 1
+            self.last_regional_result = SimpleNamespace(
+                provenance=np.full((2, 2), 2, dtype=np.uint8),
+                confidence=np.full((2, 2), 0.8, dtype=np.float32),
+                route_counts={"smooth_motion": 4},
+                provenance_counts={"interpolated": 4},
+                admission_reason="within_budget",
+            )
+            return ((frame_a.astype(np.uint16) + frame_b.astype(np.uint16)) // 2).astype(
+                np.uint8
+            )
+
+        def interpolate_at(self, frame_a, frame_b, position):
+            raise AssertionError("buffer reserve must not run a second model inference")
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    interpolator = CountingInterpolator()
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=interpolator,
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    first = np.zeros((4, 4, 3), dtype=np.uint8)
+    second = np.full((4, 4, 3), 100, dtype=np.uint8)
+    pipeline.start()
+    try:
+        pipeline.submit(first)
+        first_result = pipeline.take_latest(timeout=1.0)
+        assert first_result is not None
+        pipeline.submit(second)
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert interpolator.calls == 1
+        assert [item.generation_position for item in batch] == pytest.approx(
+            [0.5, 0.75, 1.0]
+        )
+        assert np.all(batch[0].image == 50)
+        assert np.all(batch[1].image == 75)
+        assert batch[0].generation_method == "counting"
+        assert batch[0].regional_provenance_counts == {"interpolated": 4}
+        assert batch[1].generation_method == "buffered_reserve_blend"
+        assert batch[1].regional_provenance_counts == {"reserve_blend": 4}
+        assert batch[1].regional_admission_reason == "buffered_reserve_blend"
+        assert (
+            first_result.content_timestamp
+            < batch[0].content_timestamp
+            < batch[1].content_timestamp
+            < batch[2].content_timestamp
+        )
     finally:
         pipeline.stop()
 

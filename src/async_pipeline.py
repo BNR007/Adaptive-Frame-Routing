@@ -11,6 +11,10 @@ import time
 import traceback
 from typing import Any, Callable
 
+import cv2
+import numpy as np
+
+from regional_transform import RegionProvenance
 from resource_validation import QueueSizes
 
 
@@ -37,6 +41,7 @@ class ProcessedFrame:
     processing_started_at: float
     processed_at: float
     capture_ms: float
+    content_timestamp: float | None = None
     preprocessing_ms: float | None = None
     inference_ms: float | None = None
     postprocessing_ms: float | None = None
@@ -179,6 +184,7 @@ class AsyncFramePipeline:
         capture_shutdown_on_worker: bool = False,
         frame_interpolator: Any | None = None,
         generated_frames: int = 1,
+        buffered_playout: bool = False,
         queue_depth: int = 2,
         output_max_age_ms: float = 100.0,
         collect_telemetry: bool = False,
@@ -207,8 +213,10 @@ class AsyncFramePipeline:
         self._capture_shutdown_on_worker = bool(capture_shutdown_on_worker)
         self._frame_interpolator = frame_interpolator
         self.generated_frames = generated_frames
+        self.buffered_playout = bool(buffered_playout)
         self.output_max_age_ms = float(output_max_age_ms)
         self._previous_processed_image: Any | None = None
+        self._previous_captured_at: float | None = None
         self._collect_telemetry = bool(collect_telemetry)
         self._clock = clock
         self._input = LatestFrameHandoff(queue_depth)
@@ -484,6 +492,7 @@ class AsyncFramePipeline:
                 )
                 self._presentation_results.clear()
             self._previous_processed_image = None
+            self._previous_captured_at = None
             self._result_condition.notify_all()
         return cleared + result_count
 
@@ -644,7 +653,11 @@ class AsyncFramePipeline:
 
         interpolate = self._frame_interpolator.interpolate
 
-        if self.generated_frames == 2 and self._two_frame_deadline_missed:
+        if (
+            self.generated_frames == 2
+            and not self.buffered_playout
+            and self._two_frame_deadline_missed
+        ):
             image = interpolate(frame_a, frame_b)
             # Keep the downgrade visible to telemetry and evaluation.  This is
             # one midpoint, not a successful two-insertion result.
@@ -660,6 +673,28 @@ class AsyncFramePipeline:
                     image,
                     getattr(self._frame_interpolator, "last_regional_result", None),
                 )
+            ]
+
+        if self.generated_frames == 2 and self.buffered_playout:
+            midpoint = interpolate(frame_a, frame_b)
+            midpoint_regional = getattr(
+                self._frame_interpolator, "last_regional_result", None
+            )
+            # The reserve exists to bridge a missed display slot, not to justify
+            # a second neural inference.  Blend the already generated midpoint
+            # toward the real endpoint for a sub-millisecond 0.75 candidate.
+            # Generic/string test doubles retain the old callable fallback.
+            if hasattr(midpoint, "shape") and hasattr(frame_b, "shape"):
+                reserve = cv2.addWeighted(midpoint, 0.5, frame_b, 0.5, 0.0)
+            else:
+                interpolate_at = getattr(self._frame_interpolator, "interpolate_at", None)
+                if callable(interpolate_at):
+                    reserve = interpolate_at(frame_a, frame_b, 0.75)
+                else:
+                    reserve = interpolate(midpoint, frame_b)
+            return [
+                (0.5, midpoint, midpoint_regional),
+                (0.75, reserve, midpoint_regional),
             ]
 
         if self.generated_frames == 2:
@@ -840,7 +875,11 @@ class AsyncFramePipeline:
                             current_image,
                         )
                         interpolation_ms = (self._clock() - interpolation_started) * 1000.0
-                        if self.generated_frames == 2 and len(generated_images) == 2:
+                        if (
+                            self.generated_frames == 2
+                            and not self.buffered_playout
+                            and len(generated_images) == 2
+                        ):
                             self._two_frame_pair_cost_ms = interpolation_ms
                             configured_budget = getattr(
                                 self._frame_interpolator,
@@ -883,6 +922,8 @@ class AsyncFramePipeline:
                     if generates_middle_frame
                     else current_image
                 )
+                previous_captured_at = self._previous_captured_at
+                self._previous_captured_at = captured.captured_at
                 processed_at = self._clock()
                 metadata = (
                     self._processor_metadata(captured.image, current_image)
@@ -899,11 +940,44 @@ class AsyncFramePipeline:
                     processing_started_at=processing_started_at,
                     processed_at=processed_at,
                     capture_ms=captured.capture_ms,
+                    content_timestamp=captured.captured_at,
                     **metadata,
                     **frame_generation_metadata,
                 )
                 results = []
                 for generation_position, generated_image, regional_result in generated_images:
+                    is_buffered_reserve = (
+                        self.buffered_playout and generation_position > 0.5 + 1e-6
+                    )
+                    candidate_metadata = dict(frame_generation_metadata)
+                    if is_buffered_reserve:
+                        candidate_metadata["generation_method"] = "buffered_reserve_blend"
+                    regional_provenance = (
+                        regional_result.provenance
+                        if regional_result is not None
+                        else None
+                    )
+                    regional_provenance_counts = (
+                        regional_result.provenance_counts
+                        if regional_result is not None
+                        else None
+                    )
+                    regional_admission_reason = (
+                        regional_result.admission_reason
+                        if regional_result is not None
+                        else None
+                    )
+                    if is_buffered_reserve and regional_result is not None:
+                        # The reserve is a new full-frame blend. Do not copy the
+                        # midpoint's interpolation provenance onto different pixels.
+                        regional_provenance = np.full_like(
+                            regional_result.provenance,
+                            int(RegionProvenance.RESERVE_BLEND),
+                        )
+                        regional_provenance_counts = {
+                            "reserve_blend": int(regional_provenance.size)
+                        }
+                        regional_admission_reason = "buffered_reserve_blend"
                     results.append(
                         ProcessedFrame(
                             sequence_id=captured.sequence_id,
@@ -912,15 +986,18 @@ class AsyncFramePipeline:
                             processing_started_at=processing_started_at,
                             processed_at=processed_at,
                             capture_ms=captured.capture_ms,
+                            content_timestamp=(
+                                captured.captured_at
+                                if previous_captured_at is None
+                                else previous_captured_at
+                                + generation_position
+                                * (captured.captured_at - previous_captured_at)
+                            ),
                             **metadata,
-                            **frame_generation_metadata,
+                            **candidate_metadata,
                             frame_kind="generated",
                             generation_position=generation_position,
-                            regional_provenance=(
-                                regional_result.provenance
-                                if regional_result is not None
-                                else None
-                            ),
+                            regional_provenance=regional_provenance,
                             regional_confidence=(
                                 regional_result.confidence
                                 if regional_result is not None
@@ -931,16 +1008,8 @@ class AsyncFramePipeline:
                                 if regional_result is not None
                                 else None
                             ),
-                            regional_provenance_counts=(
-                                regional_result.provenance_counts
-                                if regional_result is not None
-                                else None
-                            ),
-                            regional_admission_reason=(
-                                regional_result.admission_reason
-                                if regional_result is not None
-                                else None
-                            ),
+                            regional_provenance_counts=regional_provenance_counts,
+                            regional_admission_reason=regional_admission_reason,
                         )
                     )
                 results.append(current_result)

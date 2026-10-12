@@ -111,6 +111,111 @@ class SourceRateEstimator:
         return intervals
 
 
+class BufferedPlayoutQueue:
+    """Keep one small reserve of ordered candidates for a vsynced presenter.
+
+    Batches produced by the buffered two-candidate mode contain a normal
+    midpoint, an optional late-interval candidate, and the real endpoint.
+    The queue keeps at most one optional candidate whenever possible.  Real
+    endpoints and midpoint candidates have priority, so surplus work cannot
+    grow into latency or displace source frames.
+    """
+
+    def __init__(self, *, startup_frames: int = 3, maximum_frames: int = 4) -> None:
+        if startup_frames < 1 or maximum_frames < startup_frames:
+            raise ValueError("Buffered playout bounds are invalid.")
+        self.startup_frames = int(startup_frames)
+        self.maximum_frames = int(maximum_frames)
+        self._frames: deque[Any] = deque()
+        self._started = False
+        self._lock = threading.RLock()
+        self.dropped_optional_candidates = 0
+        self.dropped_midpoint_candidates = 0
+        self.startup_waits = 0
+        self.empty_pops = 0
+        self.last_depth_before_pop = 0
+        self.last_depth_after_pop = 0
+
+    @staticmethod
+    def _is_optional(frame: Any) -> bool:
+        return (
+            getattr(frame, "frame_kind", "processed") == "generated"
+            and float(getattr(frame, "generation_position", 0.5)) > 0.5 + 1e-6
+        )
+
+    @staticmethod
+    def _is_generated(frame: Any) -> bool:
+        return getattr(frame, "frame_kind", "processed") == "generated"
+
+    def add_batch(self, frames: Iterable[Any]) -> None:
+        with self._lock:
+            self._frames.extend(frames)
+            while len(self._frames) > self.maximum_frames:
+                items = list(self._frames)
+                removable = next(
+                    (index for index, frame in enumerate(items) if self._is_optional(frame)),
+                    None,
+                )
+                if removable is None:
+                    removable = next(
+                        (index for index, frame in enumerate(items) if self._is_generated(frame)),
+                        None,
+                    )
+                    if removable is None:
+                        # Prioritize newer real endpoints when a severe producer
+                        # burst temporarily exceeds the bounded reservoir.
+                        removable = 0
+                    else:
+                        self.dropped_midpoint_candidates += 1
+                else:
+                    self.dropped_optional_candidates += 1
+                del items[removable]
+                self._frames = deque(items)
+            if len(self._frames) >= self.startup_frames:
+                self._started = True
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._started and bool(self._frames)
+
+    @property
+    def depth(self) -> int:
+        with self._lock:
+            return len(self._frames)
+
+    def pop_next(self) -> Any | None:
+        with self._lock:
+            self.last_depth_before_pop = len(self._frames)
+            if not self._started or not self._frames:
+                if self._frames:
+                    self.startup_waits += 1
+                else:
+                    self.empty_pops += 1
+                self.last_depth_after_pop = len(self._frames)
+                return None
+            frame = self._frames.popleft()
+            self.last_depth_after_pop = len(self._frames)
+            if not self._frames:
+                # An underrun consumes the latency reserve. Require the startup
+                # depth again instead of immediately exposing one isolated frame.
+                self._started = False
+            return frame
+
+    def release_tail(self) -> None:
+        """Allow a finite stream's final partial reservoir to drain."""
+        with self._lock:
+            if self._frames:
+                self._started = True
+
+    def clear(self) -> None:
+        with self._lock:
+            self._frames.clear()
+            self._started = False
+            self.last_depth_before_pop = 0
+            self.last_depth_after_pop = 0
+
+
 class FramePacer:
     """Schedule newest presentation batches without busy waiting."""
 

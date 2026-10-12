@@ -14,7 +14,12 @@ import pytest
 
 from ui.controller import GuiController, PRESETS, RIFE_MODEL, SRVGG_MODEL, RuntimeConfiguration
 from ui.main_window import MainWindow
-from ui.settings_store import IRIS_RESEARCH_PROFILE, GuiSettings, SettingsStore
+from ui.settings_store import (
+    IRIS_BUFFERED_PROFILE,
+    IRIS_RESEARCH_PROFILE,
+    GuiSettings,
+    SettingsStore,
+)
 from window_capture import WindowInfo
 
 
@@ -104,13 +109,19 @@ def test_profile_selection_and_local_persistence(qt_app, tmp_path: Path) -> None
     assert window.method_combo.currentData() == "bicubic"
     window._rename_profile("Game")
     assert window.settings.selected_profile == "Game"
-    assert store.load().profiles == ["Default", IRIS_RESEARCH_PROFILE, "Game"]
+    assert store.load().profiles == [
+        "Default", IRIS_RESEARCH_PROFILE, IRIS_BUFFERED_PROFILE, "Game"
+    ]
     window._delete_profile()
-    assert window.settings.profiles == ["Default", IRIS_RESEARCH_PROFILE]
+    assert window.settings.profiles == [
+        "Default", IRIS_RESEARCH_PROFILE, IRIS_BUFFERED_PROFILE
+    ]
     assert window.settings.selected_profile == "Default"
     window.close()
     loaded = store.load()
-    assert loaded.profiles == ["Default", IRIS_RESEARCH_PROFILE]
+    assert loaded.profiles == [
+        "Default", IRIS_RESEARCH_PROFILE, IRIS_BUFFERED_PROFILE
+    ]
     assert loaded.selected_profile == "Default"
 
 
@@ -172,6 +183,23 @@ def test_iris_research_profile_and_condition_routing(qt_app, tmp_path: Path) -> 
         window.research_condition.findData("adaptive_routing")
     )
     assert window._configuration().regional_transform is True
+    window.close()
+
+
+def test_iris_buffered_profile_enables_bounded_extra_candidates(
+    qt_app, tmp_path: Path
+) -> None:
+    window = make_window(qt_app, tmp_path)
+    window._select_profile(IRIS_BUFFERED_PROFILE)
+    configuration = window._configuration()
+
+    assert configuration.research_enabled is True
+    assert configuration.research_condition == "adaptive_routing_buffered"
+    assert configuration.generated_frames == 2
+    assert configuration.buffered_playout is True
+    assert configuration.max_frame_latency_ms == pytest.approx(130.0)
+    args = configuration.to_engine_args()
+    assert args.buffered_playout is True
     window.close()
 
 

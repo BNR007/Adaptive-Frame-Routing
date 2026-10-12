@@ -37,6 +37,7 @@ class RuntimeConfiguration:
     upscaling_method: str = "fsr1_like"
     frame_generation: str = "off"
     generated_frames: int = 1
+    buffered_playout: bool = False
     rife_model_path: Path = RIFE_MODEL
     warmup_seconds: float = 5.0
     preset: str = "balanced"
@@ -101,6 +102,8 @@ class RuntimeConfiguration:
             raise ValueError("Target FPS must be positive.")
         if not 1 <= self.generated_frames <= 4:
             raise ValueError("Generated frames per real frame must be between 1 and 4.")
+        if self.buffered_playout and self.generated_frames != 2:
+            raise ValueError("Buffered playout requires two generated candidates.")
         if self.warmup_seconds < 0:
             raise ValueError("Warm-up duration cannot be negative.")
         if self.ai_input_width <= 0 or self.ai_input_height <= 0:
@@ -183,6 +186,7 @@ class RuntimeConfiguration:
             regional_debug_overlay=self.regional_debug_overlay,
             queue_depth=self.queue_depth, frame_generation=self.frame_generation,
             generated_frames=self.generated_frames, warmup_seconds=self.warmup_seconds,
+            buffered_playout=self.buffered_playout,
             rife_model=Path(self.rife_model_path),
             rife_device_id=(
                 self.device_id if self.rife_device_id is None else self.rife_device_id

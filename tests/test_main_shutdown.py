@@ -264,6 +264,21 @@ def test_cli_accepts_generated_frame_amount(monkeypatch, amount: int) -> None:
     assert args.generated_frames == amount
 
 
+def test_cli_accepts_buffered_playout_with_two_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--generated-frames", "2", "--buffered-playout"],
+    )
+    assert main.parse_args().buffered_playout is True
+
+
+def test_cli_rejects_buffered_playout_without_two_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["main.py", "--buffered-playout"])
+    with pytest.raises(SystemExit):
+        main.parse_args()
+
+
 def test_cli_accepts_nonnegative_warmup(monkeypatch) -> None:
     monkeypatch.setattr(sys, "argv", ["main.py", "--warmup-seconds", "5"])
     assert main.parse_args().warmup_seconds == pytest.approx(5.0)
@@ -419,6 +434,32 @@ def test_two_insertions_use_cpu_flow_provider_even_when_directml_is_selected(
     assert interpolator.options["device_id"] == 1
     assert interpolator.options["regional_transform"] is True
     assert interpolator.initialized is True
+
+
+def test_buffered_reserve_keeps_selected_provider_for_single_model_call(
+    monkeypatch,
+) -> None:
+    created = []
+
+    class FakeRIFEInterpolator:
+        def __init__(self, model_path, **options):
+            self.options = options
+            created.append(self)
+
+        def initialize(self):
+            return None
+
+    monkeypatch.setattr(main, "RIFEInterpolator", FakeRIFEInterpolator)
+    interpolator = main._create_frame_interpolator(
+        "rife",
+        provider="directml",
+        device_id=1,
+        generated_frames=2,
+        buffered_playout=True,
+    )
+
+    assert created == [interpolator]
+    assert interpolator.options["provider"] == "directml"
 
 
 def test_preview_overlay_starts_with_zero_fps(monkeypatch) -> None:

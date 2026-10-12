@@ -11,6 +11,7 @@ from resource_paths import resource_path, user_data_dir
 
 
 IRIS_RESEARCH_PROFILE = "IRIS Research 720p30"
+IRIS_BUFFERED_PROFILE = "IRIS Buffered Playout 720p30"
 
 
 @dataclass(slots=True)
@@ -23,6 +24,7 @@ class GuiSettings:
     upscaling_method: str = "fsr1_like"
     frame_generation: str = "off"
     generated_frames: int = 1
+    buffered_playout: bool = False
     rife_model_path: str = ""
     performance_preset: str = "balanced"
     target_fps: str = "auto"
@@ -114,6 +116,18 @@ def _ensure_iris_profile(settings: GuiSettings) -> GuiSettings:
         settings.profile_settings[IRIS_RESEARCH_PROFILE].update(
             {"target_fps": "60", "custom_fps": 60.0, "frame_pacing": "fixed"}
         )
+    if IRIS_BUFFERED_PROFILE not in settings.profiles:
+        settings.profiles.append(IRIS_BUFFERED_PROFILE)
+    buffered = dict(settings.profile_settings[IRIS_RESEARCH_PROFILE])
+    buffered.update(
+        {
+            "generated_frames": 2,
+            "buffered_playout": True,
+            "max_frame_latency_ms": 130.0,
+            "research_condition": "adaptive_routing_buffered",
+        }
+    )
+    settings.profile_settings[IRIS_BUFFERED_PROFILE] = buffered
     return settings
 
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
-from frame_pacing import FramePacer, PresentationFrame
+from frame_pacing import BufferedPlayoutQueue, FramePacer, PresentationFrame
 
 
 class FakeClock:
@@ -343,3 +344,109 @@ def test_vsynced_presenter_still_rejects_stale_generated_frame():
 
     assert not decision.present
     assert decision.reason == "stale_generated"
+
+
+def test_buffered_playout_waits_for_startup_reservoir_and_preserves_order():
+    queue = BufferedPlayoutQueue(startup_frames=3, maximum_frames=4)
+    queue.add_batch([frame("A", 100.0)])
+    assert not queue.ready
+    queue.add_batch([
+        frame("M", 100.01, "generated"),
+        frame("E", 100.01, "generated"),
+        frame("B", 100.01),
+    ])
+    assert queue.ready
+    assert [queue.pop_next().payload for _ in range(4)] == ["A", "M", "E", "B"]
+
+
+def test_buffered_playout_discards_optional_candidate_before_midpoint_or_real():
+    queue = BufferedPlayoutQueue(startup_frames=3, maximum_frames=4)
+    midpoint_live = type("F", (), {"frame_kind": "generated", "generation_position": 0.5})()
+    optional_one = type("F", (), {"frame_kind": "generated", "generation_position": 0.75})()
+    optional_two = type("F", (), {"frame_kind": "generated", "generation_position": 0.75})()
+    real_one = type("F", (), {"frame_kind": "processed", "generation_position": 1.0})()
+    real_two = type("F", (), {"frame_kind": "processed", "generation_position": 1.0})()
+    queue.add_batch([midpoint_live, optional_one, real_one, real_two, optional_two])
+
+    remaining = [queue.pop_next() for _ in range(queue.depth)]
+    assert optional_one not in remaining
+    assert optional_two in remaining
+    assert midpoint_live in remaining
+    assert real_one in remaining and real_two in remaining
+    assert queue.dropped_optional_candidates == 1
+
+
+def test_buffered_playout_uses_reserve_candidates_to_cover_bounded_source_jitter():
+    queue = BufferedPlayoutQueue(startup_frames=3, maximum_frames=4)
+
+    def candidate(kind: str, position: float):
+        return SimpleNamespace(frame_kind=kind, generation_position=position)
+
+    producer_times = [0.0]
+    produced_at = 0.0
+    # Mean source cadence remains 30 Hz, but individual deliveries alternate
+    # between a 50 ms stall and a 16.7 ms catch-up interval.
+    jitter_pattern = (1.0 / 30.0, 1.0 / 30.0, 0.050, 1.0 / 60.0)
+    while produced_at < 15.0:
+        produced_at += jitter_pattern[(len(producer_times) - 1) % len(jitter_pattern)]
+        producer_times.append(produced_at)
+
+    producer_index = 0
+    display_time = producer_times[1]
+    missed_slots = 0
+    displayed = 0
+    while display_time < 15.0:
+        while (
+            producer_index < len(producer_times)
+            and producer_times[producer_index] <= display_time
+        ):
+            if producer_index == 0:
+                queue.add_batch([candidate("processed", 1.0)])
+            else:
+                queue.add_batch(
+                    [
+                        candidate("generated", 0.5),
+                        candidate("generated", 0.75),
+                        candidate("processed", 1.0),
+                    ]
+                )
+            producer_index += 1
+        if queue.pop_next() is None:
+            missed_slots += 1
+        else:
+            displayed += 1
+        assert queue.depth <= queue.maximum_frames
+        display_time += 1.0 / 60.0
+
+    assert displayed >= 895
+    assert missed_slots == 0
+    assert queue.dropped_optional_candidates > 0
+
+
+def test_buffered_playout_can_release_short_finite_tail():
+    queue = BufferedPlayoutQueue(startup_frames=3, maximum_frames=4)
+    only_frame = SimpleNamespace(frame_kind="processed", generation_position=1.0)
+    queue.add_batch([only_frame])
+
+    assert queue.pop_next() is None
+    queue.release_tail()
+    assert queue.pop_next() is only_frame
+
+
+def test_buffered_playout_clear_discards_recovery_stale_frames_and_rebuffers():
+    queue = BufferedPlayoutQueue(startup_frames=3, maximum_frames=4)
+    frames = [
+        SimpleNamespace(frame_kind="generated", generation_position=0.5),
+        SimpleNamespace(frame_kind="generated", generation_position=0.75),
+        SimpleNamespace(frame_kind="processed", generation_position=1.0),
+    ]
+    queue.add_batch(frames)
+    assert queue.ready is True
+
+    queue.clear()
+    queue.add_batch([frames[-1]])
+
+    assert queue.depth == 1
+    assert queue.ready is False
+    assert queue.pop_next() is None
+    assert queue.startup_waits == 1

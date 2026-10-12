@@ -41,6 +41,7 @@ class RegionProvenance(IntEnum):
     MIDPOINT_BLEND = 6
     ADMISSION_FALLBACK = 7
     TEMPORAL_BLEND = 8
+    RESERVE_BLEND = 9
 
 
 @dataclass(frozen=True, slots=True)
