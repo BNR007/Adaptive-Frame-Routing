@@ -292,3 +292,54 @@ def test_gui_overload_keeps_latest_real_but_drops_late_generated():
     assert decisions[1].present
     assert clock.waits == []
     assert pacer.snapshot().presented_real_frames == 1
+
+
+def test_vsynced_presenter_owns_cadence_without_double_dropping_generation():
+    clock = FakeClock(100.0)
+    pacer = FramePacer(
+        mode="fixed",
+        target_fps=60,
+        max_frame_latency_ms=100,
+        clock=clock,
+        waiter=clock.wait,
+        keep_latest_real=True,
+        presenter_controls_cadence=True,
+    )
+    pacer.pace_batch([frame("A", 100.0)])
+
+    # Simulate the caller spending several refresh intervals inside Present.
+    # The software schedule is now historically late, but the fresh midpoint
+    # must still reach the swap chain instead of being discarded twice.
+    clock.value = 100.05
+    decisions = pacer.iter_pace_batch([
+        frame("M", 100.04, "generated"),
+        frame("B", 100.04),
+    ])
+    midpoint = next(decisions)
+    assert midpoint.present
+    assert midpoint.frame.payload == "M"
+    clock.value += 1 / 60
+    real = next(decisions)
+    assert real.present
+    assert real.frame.payload == "B"
+    assert clock.waits == []
+    snapshot = pacer.snapshot()
+    assert snapshot.generated_frames_dropped_late == 0
+    assert snapshot.target_interval_ms == pytest.approx(1000 / 60)
+
+
+def test_vsynced_presenter_still_rejects_stale_generated_frame():
+    clock = FakeClock(100.2)
+    pacer = FramePacer(
+        mode="fixed",
+        target_fps=60,
+        max_frame_latency_ms=100,
+        clock=clock,
+        waiter=clock.wait,
+        presenter_controls_cadence=True,
+    )
+
+    decision = pacer.pace_batch([frame("M", 100.0, "generated")])[0]
+
+    assert not decision.present
+    assert decision.reason == "stale_generated"

@@ -904,6 +904,10 @@ def run_application(
         ),
         shutdown_event=shutdown_event,
         keep_latest_real=getattr(args, "keep_latest_real", False),
+        presenter_controls_cadence=(
+            not bool(getattr(args, "no_preview", False))
+            and getattr(args, "preview_presenter", "opencv") == "d3d11"
+        ),
     )
 
     app_config = ApplicationConfig()
@@ -1637,6 +1641,7 @@ def run_application(
                                 "D3D11 flip presenter enabled: click-through, vsync on, "
                                 "maximum queued frame latency 1, "
                                 "%d Hz display / refresh cadence %s; "
+                                "swap chain owns cadence (no duplicate software wait); "
                                 "Alt-Tab hides output and Ctrl+Alt+Q stops.",
                                 native_presenter.refresh_hz,
                                 native_presenter.cadence_description,

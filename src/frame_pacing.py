@@ -124,6 +124,7 @@ class FramePacer:
         shutdown_event: threading.Event | None = None,
         waiter: Callable[[float], bool] | None = None,
         keep_latest_real: bool = False,
+        presenter_controls_cadence: bool = False,
     ) -> None:
         normalized_mode = str(mode).strip().lower()
         if normalized_mode not in PACING_MODES:
@@ -138,6 +139,7 @@ class FramePacer:
             raise ValueError("Fixed frame pacing requires --target-fps.")
 
         self.keep_latest_real = keep_latest_real
+        self.presenter_controls_cadence = bool(presenter_controls_cadence)
         self.mode = normalized_mode
         self.target_fps = None if target_fps is None else float(target_fps)
         self.max_frame_latency_ms = float(max_frame_latency_ms)
@@ -197,6 +199,15 @@ class FramePacer:
             if frame.frame_kind != "generated":
                 self._source_rate.add(frame.captured_at, frame.source_sequence_id)
         interval = self._interval(batch_size=len(batch))
+        configured_interval = interval
+
+        # A blocking vsynced presenter is itself the presentation clock.  Do
+        # not apply a second wall-clock deadline to its input: time spent in
+        # Present is expected and previously made the next generated frame
+        # look late before it reached the swap chain.  Freshness checks below
+        # remain active, while every accepted frame is serialized by Present.
+        if self.presenter_controls_cadence:
+            interval = None
 
         # Auto pacing starts uncapped while the source cadence is learned.
         # When generated output first becomes paceable, reserve exactly one
@@ -221,7 +232,9 @@ class FramePacer:
             frame.frame_kind == "generated" for frame in batch
         ):
             self._generated_cadence_started = True
-        self._active_interval = interval
+        # Retain the configured target for telemetry and cadence-miss
+        # accounting even when the blocking presenter performs the wait.
+        self._active_interval = configured_interval
 
         for index, frame in enumerate(batch):
             now = self._clock()
