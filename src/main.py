@@ -1304,10 +1304,16 @@ def run_application(
     if frame_interpolator is not None:
         logger.info("Selected RIFE model: %s", getattr(args, "rife_model", None) or DEFAULT_RIFE_MODEL_PATH)
         if getattr(args, "generated_frames", 1) == 2:
-            logger.info(
-                "Two-insertion mode: CPU regional/flow generation at 1/3 and 2/3; "
-                "the selected neural provider is not used for these insertions."
-            )
+            if bool(getattr(args, "buffered_playout", False)):
+                logger.info(
+                    "Buffered playout: one midpoint plus an optional cheap reserve; "
+                    "camera motion suppresses the reserve to preserve even motion timing."
+                )
+            else:
+                logger.info(
+                    "Two-insertion mode: CPU regional/flow generation at 1/3 and 2/3; "
+                    "the selected neural provider is not used for these insertions."
+                )
         elif getattr(args, "ai_provider", "cpu") == "directml":
             logger.info(
                 "Requested frame-generation DirectML device: %s",

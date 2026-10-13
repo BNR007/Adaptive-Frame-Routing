@@ -61,6 +61,9 @@ class ProcessedFrame:
     regional_route_counts: dict[str, int] | None = None
     regional_provenance_counts: dict[str, int] | None = None
     regional_admission_reason: str | None = None
+    global_motion_pixels: float | None = None
+    global_motion_response: float | None = None
+    reserve_suppressed: bool = False
 
     @property
     def frame_age_ms(self) -> float:
@@ -239,6 +242,9 @@ class AsyncFramePipeline:
         # capture and publishing an already-stale three-frame batch.
         self._two_frame_pair_cost_ms: float | None = None
         self._two_frame_deadline_missed = False
+        self._last_global_motion_pixels = 0.0
+        self._last_global_motion_response = 0.0
+        self._last_reserve_suppressed = False
         self._started = False
         self._stopped = False
         self._capture_finished = capture_source is None
@@ -676,6 +682,29 @@ class AsyncFramePipeline:
             ]
 
         if self.generated_frames == 2 and self.buffered_playout:
+            camera_motion = self._camera_motion_estimate(frame_a, frame_b)
+            if camera_motion is not None:
+                motion_pixels, response = camera_motion
+                self._last_global_motion_pixels = motion_pixels
+                self._last_global_motion_response = response
+                self._last_reserve_suppressed = True
+                midpoint = interpolate(frame_a, frame_b)
+                try:
+                    self._frame_interpolator.last_generation_method = (
+                        "camera_motion_midpoint"
+                    )
+                except (AttributeError, TypeError):
+                    pass
+                # A reserve at 0.75 occupies a complete refresh interval but
+                # advances only a quarter of the source interval. During a pan
+                # this creates visible slow-fast motion. Keep a single,
+                # geometrically placed midpoint so 30 Hz input remains evenly
+                # spaced at 60 Hz output.
+                return [(0.5, midpoint, None)]
+
+            self._last_global_motion_pixels = 0.0
+            self._last_global_motion_response = 0.0
+            self._last_reserve_suppressed = False
             midpoint = interpolate(frame_a, frame_b)
             midpoint_regional = getattr(
                 self._frame_interpolator, "last_regional_result", None
@@ -746,6 +775,62 @@ class AsyncFramePipeline:
             (0.625, five_eighths, five_eighths_regional),
             (0.875, seven_eighths, seven_eighths_regional),
         ]
+
+    @staticmethod
+    def _camera_motion_estimate(
+        frame_a: Any,
+        frame_b: Any,
+    ) -> tuple[float, float] | None:
+        """Detect dominant camera motion cheaply at a fixed tiny resolution.
+
+        Phase correlation is deliberately computed on a tiny image. A broad
+        active area plus a coherent translation distinguishes camera motion
+        from a moving object, animated HUD, or capture noise.
+        """
+
+        if not (
+            isinstance(frame_a, np.ndarray)
+            and isinstance(frame_b, np.ndarray)
+            and frame_a.shape == frame_b.shape
+            and frame_a.ndim == 3
+            and frame_a.dtype == np.uint8
+            and frame_b.dtype == np.uint8
+        ):
+            return None
+        height, width = frame_a.shape[:2]
+        scale = min(1.0, 160.0 / max(width, 1), 90.0 / max(height, 1))
+        small_size = (
+            max(32, int(round(width * scale))),
+            max(18, int(round(height * scale))),
+        )
+        first = cv2.resize(frame_a, small_size, interpolation=cv2.INTER_AREA)
+        second = cv2.resize(frame_b, small_size, interpolation=cv2.INTER_AREA)
+        gray_a = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
+        gray_b = cv2.cvtColor(second, cv2.COLOR_BGR2GRAY)
+        difference = cv2.absdiff(gray_a, gray_b)
+        active_fraction = float(np.mean(difference >= 8))
+        # At 160x90 a coherent camera pan often changes only 6-12% of pixels
+        # by eight luma levels because large underwater regions are smooth.
+        # Requiring a larger area missed the exact Subnautica turns this gate
+        # is intended to stabilize.
+        if active_fraction < 0.06:
+            return None
+        window = cv2.createHanningWindow(small_size, cv2.CV_32F)
+        (shift_x, shift_y), response = cv2.phaseCorrelate(
+            gray_a.astype(np.float32),
+            gray_b.astype(np.float32),
+            window,
+        )
+        if not np.isfinite((shift_x, shift_y, response)).all():
+            return None
+        scale_x = width / small_size[0]
+        scale_y = height / small_size[1]
+        full_shift_x = float(shift_x * scale_x)
+        full_shift_y = float(shift_y * scale_y)
+        motion_pixels = math.hypot(full_shift_x, full_shift_y)
+        if response < 0.15 or motion_pixels < 1.25:
+            return None
+        return motion_pixels, float(response)
 
     def _publish_results(self, results: list[ProcessedFrame]) -> None:
         """Publish bounded ordered batches without pre-empting a midpoint.
@@ -941,6 +1026,9 @@ class AsyncFramePipeline:
                     processed_at=processed_at,
                     capture_ms=captured.capture_ms,
                     content_timestamp=captured.captured_at,
+                    global_motion_pixels=self._last_global_motion_pixels,
+                    global_motion_response=self._last_global_motion_response,
+                    reserve_suppressed=self._last_reserve_suppressed,
                     **metadata,
                     **frame_generation_metadata,
                 )
@@ -997,6 +1085,9 @@ class AsyncFramePipeline:
                             **candidate_metadata,
                             frame_kind="generated",
                             generation_position=generation_position,
+                            global_motion_pixels=self._last_global_motion_pixels,
+                            global_motion_response=self._last_global_motion_response,
+                            reserve_suppressed=self._last_reserve_suppressed,
                             regional_provenance=regional_provenance,
                             regional_confidence=(
                                 regional_result.confidence

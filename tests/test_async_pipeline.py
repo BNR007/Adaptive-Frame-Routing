@@ -6,6 +6,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 
@@ -540,6 +541,66 @@ def test_buffered_reserve_uses_one_model_call_for_image_frames():
         )
     finally:
         pipeline.stop()
+
+
+def test_camera_motion_keeps_midpoint_and_suppresses_time_dilating_reserve():
+    class CountingInterpolator:
+        produces_intermediate_frame = True
+        active_providers = ("test",)
+        last_generation_method = "unused"
+        last_regional_result = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def interpolate(self, frame_a, frame_b):
+            self.calls += 1
+            return cv2.addWeighted(frame_a, 0.5, frame_b, 0.5, 0.0)
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    rng = np.random.default_rng(17)
+    first = rng.integers(0, 256, (180, 320, 3), dtype=np.uint8)
+    second = cv2.warpAffine(
+        first,
+        np.float32(((1.0, 0.0, 10.0), (0.0, 1.0, -4.0))),
+        (320, 180),
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    interpolator = CountingInterpolator()
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=interpolator,
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    pipeline.start()
+    try:
+        pipeline.submit(first)
+        assert pipeline.take_latest(timeout=1.0) is not None
+        pipeline.submit(second)
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert [item.generation_position for item in batch] == pytest.approx([0.5, 1.0])
+        assert interpolator.calls == 1
+        assert batch[0].generation_method == "camera_motion_midpoint"
+        assert batch[0].reserve_suppressed is True
+        assert batch[0].global_motion_pixels is not None
+        assert batch[0].global_motion_pixels > 5.0
+        np.testing.assert_array_equal(
+            batch[0].image,
+            cv2.addWeighted(first, 0.5, second, 0.5, 0.0),
+        )
+    finally:
+        pipeline.stop()
+
+
+def test_local_motion_keeps_buffered_reserve_candidate():
+    first = np.zeros((180, 320, 3), dtype=np.uint8)
+    second = first.copy()
+    cv2.rectangle(second, (130, 70), (160, 100), (255, 255, 255), -1)
+    assert AsyncFramePipeline._camera_motion_estimate(first, second) is None
 
 
 def test_two_frame_deadline_miss_degrades_to_stable_midpoint():

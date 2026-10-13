@@ -38,6 +38,9 @@ FRAME_FIELDS = (
     "frame_kind",
     "generation_method",
     "generation_position",
+    "global_motion_pixels",
+    "global_motion_response",
+    "reserve_suppressed",
     "active_provider",
     "interpolation_provider",
     "frame_generation",
@@ -678,6 +681,17 @@ class ResearchRunRecorder:
                 "frame_kind": processed_frame.frame_kind,
                 "generation_method": processed_frame.generation_method,
                 "generation_position": processed_frame.generation_position,
+                "global_motion_pixels": (
+                    "" if getattr(processed_frame, "global_motion_pixels", None) is None
+                    else processed_frame.global_motion_pixels
+                ),
+                "global_motion_response": (
+                    "" if getattr(processed_frame, "global_motion_response", None) is None
+                    else processed_frame.global_motion_response
+                ),
+                "reserve_suppressed": int(
+                    getattr(processed_frame, "reserve_suppressed", False)
+                ),
                 "active_provider": processed_frame.active_provider,
                 "interpolation_provider": processed_frame.interpolation_provider,
                 "frame_generation": processed_frame.frame_generation,
