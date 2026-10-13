@@ -522,16 +522,23 @@ def test_buffered_reserve_uses_one_model_call_for_image_frames():
         assert first_result is not None
         pipeline.submit(second)
         batch = pipeline.take_presentation_batch(timeout=1.0)
+        deadline = time.perf_counter() + 1.0
+        while (
+            pipeline.refinement_completed_on_time == 0
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.005)
         assert interpolator.calls == 1
         assert [item.generation_position for item in batch] == pytest.approx(
             [0.5, 0.75, 1.0]
         )
+        batch[0] = pipeline.resolve_refinement(batch[0])
         assert np.all(batch[0].image == 50)
         assert np.all(batch[1].image == 75)
         assert batch[0].generation_method == "counting"
         assert batch[0].regional_provenance_counts == {"interpolated": 4}
         assert batch[1].generation_method == "buffered_reserve_blend"
-        assert batch[1].regional_provenance_counts == {"reserve_blend": 4}
+        assert batch[1].regional_provenance_counts == {"reserve_blend": 16}
         assert batch[1].regional_admission_reason == "buffered_reserve_blend"
         assert (
             first_result.content_timestamp
@@ -583,8 +590,15 @@ def test_camera_motion_keeps_midpoint_and_suppresses_time_dilating_reserve():
         pipeline.submit(second)
         batch = pipeline.take_presentation_batch(timeout=1.0)
         assert [item.generation_position for item in batch] == pytest.approx([0.5, 1.0])
+        deadline = time.perf_counter() + 1.0
+        while (
+            pipeline.refinement_completed_on_time == 0
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.005)
         assert interpolator.calls == 1
-        assert batch[0].generation_method == "camera_motion_midpoint"
+        batch[0] = pipeline.resolve_refinement(batch[0])
+        assert batch[0].generation_method == "camera_motion_neural_refinement"
         assert batch[0].reserve_suppressed is True
         assert batch[0].global_motion_pixels is not None
         assert batch[0].global_motion_pixels > 5.0
@@ -601,6 +615,110 @@ def test_local_motion_keeps_buffered_reserve_candidate():
     second = first.copy()
     cv2.rectangle(second, (130, 70), (160, 100), (255, 255, 255), -1)
     assert AsyncFramePipeline._camera_motion_estimate(first, second) is None
+
+
+def test_slow_neural_refinement_never_blocks_fallback_or_real_endpoint():
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowInterpolator:
+        produces_intermediate_frame = True
+        active_providers = ("test",)
+        last_generation_method = "rife_midpoint"
+        last_regional_result = None
+
+        def interpolate(self, frame_a, frame_b):
+            started.set()
+            assert release.wait(2.0)
+            return np.full_like(frame_b, 77)
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=SlowInterpolator(),
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    first = np.zeros((24, 32, 3), dtype=np.uint8)
+    second = np.full_like(first, 100)
+    pipeline.start()
+    try:
+        pipeline.submit(first)
+        assert pipeline.take_latest(timeout=1.0) is not None
+        pipeline.submit(second)
+        assert started.wait(1.0)
+
+        # The complete cadence-safe batch arrives while neural inference is
+        # deliberately still blocked on another thread.
+        batch = pipeline.take_presentation_batch(timeout=0.25)
+        assert [item.generation_position for item in batch] == pytest.approx(
+            [0.5, 0.75, 1.0]
+        )
+        resolved = pipeline.resolve_refinement(batch[0])
+        assert resolved.generation_method == "deadline_fallback_midpoint"
+        assert np.all(resolved.image == 50)
+        assert np.all(batch[-1].image == 100)
+
+        release.set()
+        deadline = time.perf_counter() + 1.0
+        while pipeline.refinement_late_drops == 0 and time.perf_counter() < deadline:
+            time.sleep(0.005)
+        assert pipeline.refinement_late_drops == 1
+        assert pipeline.refinement_fallback_presented == 1
+    finally:
+        release.set()
+        pipeline.stop()
+
+
+def test_fast_neural_refinement_atomically_upgrades_pending_midpoint():
+    completed = threading.Event()
+
+    class FastInterpolator:
+        produces_intermediate_frame = True
+        active_providers = ("test",)
+        last_generation_method = "rife_midpoint"
+        last_regional_result = None
+
+        def interpolate(self, frame_a, frame_b):
+            result = np.full_like(frame_b, 77)
+            completed.set()
+            return result
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=FastInterpolator(),
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    first = np.zeros((24, 32, 3), dtype=np.uint8)
+    second = np.full_like(first, 100)
+    pipeline.start()
+    try:
+        pipeline.submit(first)
+        assert pipeline.take_latest(timeout=1.0) is not None
+        pipeline.submit(second)
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        assert completed.wait(1.0)
+        deadline = time.perf_counter() + 1.0
+        while (
+            pipeline.refinement_completed_on_time == 0
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.005)
+        resolved = pipeline.resolve_refinement(batch[0])
+        assert resolved.generation_method == "rife_midpoint"
+        assert np.all(resolved.image == 77)
+        assert pipeline.refinement_applied == 1
+        assert pipeline.refinement_fallback_presented == 0
+    finally:
+        pipeline.stop()
 
 
 def test_two_frame_deadline_miss_degrades_to_stable_midpoint():

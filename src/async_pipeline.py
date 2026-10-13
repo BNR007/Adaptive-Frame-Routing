@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import math
 import threading
@@ -14,7 +14,6 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from regional_transform import RegionProvenance
 from resource_validation import QueueSizes
 
 
@@ -78,6 +77,52 @@ class ProcessedFrame:
     @property
     def end_to_end_ms(self) -> float:
         return (self.processed_at - self.captured_at) * 1000.0
+
+
+class DeferredRefinement:
+    """Atomically choose a neural refinement or its cadence-safe fallback.
+
+    The processing worker publishes the fallback immediately.  A separate
+    worker may publish a refined image until the presenter resolves this
+    object.  Resolution closes the slot, so a late inference can never mutate
+    pixels which are already being uploaded or displayed.
+    """
+
+    def __init__(self, fallback: np.ndarray) -> None:
+        self._fallback = fallback
+        self._refined: np.ndarray | None = None
+        self._metadata: dict[str, Any] = {}
+        self._resolved = False
+        self._lock = threading.Lock()
+
+    def publish(self, image: np.ndarray, metadata: dict[str, Any]) -> bool:
+        with self._lock:
+            if self._resolved:
+                return False
+            self._refined = image
+            self._metadata = dict(metadata)
+            return True
+
+    def resolve(self) -> tuple[np.ndarray, bool, dict[str, Any]]:
+        with self._lock:
+            self._resolved = True
+            if self._refined is not None:
+                return self._refined, True, dict(self._metadata)
+            return self._fallback, False, {}
+
+    def discard(self) -> None:
+        with self._lock:
+            self._resolved = True
+            self._refined = None
+            self._metadata.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class _RefinementJob:
+    frame_a: np.ndarray
+    frame_b: np.ndarray
+    target: DeferredRefinement
+    camera_motion: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +281,15 @@ class AsyncFramePipeline:
         self._stale_reserved_batches = 0
         self._interpolated_frames = 0
         self._interpolation_failures = 0
+        self._refinement_submitted = 0
+        self._refinement_completed_on_time = 0
+        self._refinement_applied = 0
+        self._refinement_fallback_presented = 0
+        self._refinement_late_drops = 0
+        self._refinement_job_replacements = 0
+        self._refinement_condition = threading.Condition()
+        self._refinement_job: _RefinementJob | None = None
+        self._refinement_closed = False
         # Fractional 1/3 + 2/3 generation is allowed to prove that it fits the
         # live deadline once.  If it does not, preserve the known-good midpoint
         # path for the rest of the session instead of repeatedly starving
@@ -255,6 +309,15 @@ class AsyncFramePipeline:
             target=self._run_processing_worker,
             name=worker_name,
             daemon=False,
+        )
+        self._refinement_thread = (
+            threading.Thread(
+                target=self._run_refinement_worker,
+                name="neural-refinement-worker",
+                daemon=False,
+            )
+            if frame_interpolator is not None and self.buffered_playout
+            else None
         )
         self._capture_thread = (
             threading.Thread(
@@ -304,6 +367,36 @@ class AsyncFramePipeline:
             return self._interpolation_failures
 
     @property
+    def refinement_submitted(self) -> int:
+        with self._state_lock:
+            return self._refinement_submitted
+
+    @property
+    def refinement_applied(self) -> int:
+        with self._state_lock:
+            return self._refinement_applied
+
+    @property
+    def refinement_completed_on_time(self) -> int:
+        with self._state_lock:
+            return self._refinement_completed_on_time
+
+    @property
+    def refinement_fallback_presented(self) -> int:
+        with self._state_lock:
+            return self._refinement_fallback_presented
+
+    @property
+    def refinement_late_drops(self) -> int:
+        with self._state_lock:
+            return self._refinement_late_drops
+
+    @property
+    def refinement_job_replacements(self) -> int:
+        with self._state_lock:
+            return self._refinement_job_replacements
+
+    @property
     def submitted_frames(self) -> int:
         with self._state_lock:
             return self._submitted_frames
@@ -328,7 +421,11 @@ class AsyncFramePipeline:
         capture_alive = (
             self._capture_thread is not None and self._capture_thread.is_alive()
         )
-        return capture_alive or self._processing_thread.is_alive()
+        refinement_alive = (
+            self._refinement_thread is not None
+            and self._refinement_thread.is_alive()
+        )
+        return capture_alive or self._processing_thread.is_alive() or refinement_alive
 
     def queue_sizes(self) -> QueueSizes:
         """Return an atomic-enough validation snapshot of bounded queue sizes."""
@@ -343,6 +440,8 @@ class AsyncFramePipeline:
         if self._stopped:
             raise RuntimeError("A stopped asynchronous pipeline cannot be restarted.")
         self._started = True
+        if self._refinement_thread is not None:
+            self._refinement_thread.start()
         self._processing_thread.start()
         if self._capture_thread is not None:
             self._capture_thread.start()
@@ -524,6 +623,12 @@ class AsyncFramePipeline:
         if not self._capture_shutdown_on_worker:
             self._call_capture_shutdown()
         self._input.close(discard=True)
+        with self._refinement_condition:
+            self._refinement_closed = True
+            if self._refinement_job is not None:
+                self._refinement_job.target.discard()
+                self._refinement_job = None
+            self._refinement_condition.notify_all()
         with self._result_condition:
             self._result_condition.notify_all()
 
@@ -533,7 +638,11 @@ class AsyncFramePipeline:
         deadline = self._clock() + timeout
         threads = [
             thread
-            for thread in (self._capture_thread, self._processing_thread)
+            for thread in (
+                self._capture_thread,
+                self._processing_thread,
+                self._refinement_thread,
+            )
             if thread is not None
         ]
         for thread in threads:
@@ -650,6 +759,149 @@ class AsyncFramePipeline:
             "generation_method": generation_method,
         }
 
+    def _submit_refinement(
+        self,
+        frame_a: np.ndarray,
+        frame_b: np.ndarray,
+        target: DeferredRefinement,
+        *,
+        camera_motion: bool = False,
+    ) -> None:
+        """Submit newest-only neural work without delaying the cadence path."""
+
+        with self._refinement_condition:
+            if self._refinement_closed:
+                target.discard()
+                return
+            if self._refinement_job is not None:
+                self._refinement_job.target.discard()
+                with self._state_lock:
+                    self._refinement_job_replacements += 1
+            self._refinement_job = _RefinementJob(
+                frame_a=frame_a,
+                frame_b=frame_b,
+                target=target,
+                camera_motion=camera_motion,
+            )
+            with self._state_lock:
+                self._refinement_submitted += 1
+            self._refinement_condition.notify()
+
+    def resolve_refinement(self, frame: ProcessedFrame) -> ProcessedFrame:
+        """Resolve deferred pixels immediately before presentation/measurement."""
+
+        if not isinstance(frame.image, DeferredRefinement):
+            return frame
+        image, refined, metadata = frame.image.resolve()
+        with self._state_lock:
+            if refined:
+                self._refinement_applied += 1
+            else:
+                self._refinement_fallback_presented += 1
+        if not refined:
+            return replace(
+                frame,
+                image=image,
+                generation_method="deadline_fallback_midpoint",
+                interpolation_ms=0.0,
+                interpolation_provider="OpenCV cadence fallback",
+                regional_admission_reason="neural_not_ready_at_presentation",
+            )
+        return replace(
+            frame,
+            image=image,
+            interpolation_ms=metadata.get("interpolation_ms"),
+            interpolation_provider=metadata.get(
+                "interpolation_provider", frame.interpolation_provider
+            ),
+            generation_method=metadata.get(
+                "generation_method", "neural_refined_midpoint"
+            ),
+            regional_provenance=metadata.get("regional_provenance"),
+            regional_confidence=metadata.get("regional_confidence"),
+            regional_route_counts=metadata.get("regional_route_counts"),
+            regional_provenance_counts=metadata.get("regional_provenance_counts"),
+            regional_admission_reason=metadata.get(
+                "regional_admission_reason", "neural_ready_before_presentation"
+            ),
+        )
+
+    @staticmethod
+    def discard_refinement(frame: ProcessedFrame) -> None:
+        """Close deferred work for a pacing decision that will not be shown."""
+
+        if isinstance(frame.image, DeferredRefinement):
+            frame.image.discard()
+
+    def _run_refinement_worker(self) -> None:
+        """Run best-effort interpolation independently of capture/processing."""
+
+        while True:
+            with self._refinement_condition:
+                self._refinement_condition.wait_for(
+                    lambda: self._refinement_job is not None or self._refinement_closed
+                )
+                if self._refinement_job is None and self._refinement_closed:
+                    return
+                job = self._refinement_job
+                self._refinement_job = None
+            if job is None:
+                continue
+            started = self._clock()
+            try:
+                image = self._frame_interpolator.interpolate(job.frame_a, job.frame_b)
+                interpolation_ms = (self._clock() - started) * 1000.0
+                regional = getattr(
+                    self._frame_interpolator, "last_regional_result", None
+                )
+                generation_method = getattr(
+                    self._frame_interpolator,
+                    "last_generation_method",
+                    "neural_refined_midpoint",
+                )
+                if job.camera_motion:
+                    generation_method = "camera_motion_neural_refinement"
+                active_providers = getattr(
+                    self._frame_interpolator, "active_providers", ()
+                )
+                metadata = {
+                    "interpolation_ms": interpolation_ms,
+                    "interpolation_provider": (
+                        str(active_providers[0]) if active_providers else "unknown"
+                    ),
+                    "generation_method": generation_method,
+                    "regional_provenance": (
+                        regional.provenance if regional is not None else None
+                    ),
+                    "regional_confidence": (
+                        regional.confidence if regional is not None else None
+                    ),
+                    "regional_route_counts": (
+                        regional.route_counts if regional is not None else None
+                    ),
+                    "regional_provenance_counts": (
+                        regional.provenance_counts if regional is not None else None
+                    ),
+                    "regional_admission_reason": (
+                        regional.admission_reason
+                        if regional is not None
+                        else "neural_ready_before_presentation"
+                    ),
+                }
+                if job.target.publish(image, metadata):
+                    with self._state_lock:
+                        self._refinement_completed_on_time += 1
+                else:
+                    with self._state_lock:
+                        self._refinement_late_drops += 1
+            except Exception as error:
+                with self._state_lock:
+                    self._interpolation_failures += 1
+                logger.warning(
+                    "Neural refinement failed; cadence fallback remains active: %s",
+                    error,
+                )
+
     def _generate_intermediate_frames(
         self,
         frame_a: Any,
@@ -683,6 +935,35 @@ class AsyncFramePipeline:
 
         if self.generated_frames == 2 and self.buffered_playout:
             camera_motion = self._camera_motion_estimate(frame_a, frame_b)
+            if isinstance(frame_a, np.ndarray) and isinstance(frame_b, np.ndarray):
+                # Publish a cheap, correctly timed midpoint now.  Neural work
+                # runs on its own newest-only worker and may replace these
+                # pixels atomically until the presenter resolves the frame.
+                midpoint_fallback = cv2.addWeighted(
+                    frame_a, 0.5, frame_b, 0.5, 0.0
+                )
+                midpoint = DeferredRefinement(midpoint_fallback)
+                self._submit_refinement(
+                    frame_a,
+                    frame_b,
+                    midpoint,
+                    camera_motion=camera_motion is not None,
+                )
+                if camera_motion is not None:
+                    motion_pixels, response = camera_motion
+                    self._last_global_motion_pixels = motion_pixels
+                    self._last_global_motion_response = response
+                    self._last_reserve_suppressed = True
+                    return [(0.5, midpoint, None)]
+
+                self._last_global_motion_pixels = 0.0
+                self._last_global_motion_response = 0.0
+                self._last_reserve_suppressed = False
+                reserve = cv2.addWeighted(
+                    midpoint_fallback, 0.5, frame_b, 0.5, 0.0
+                )
+                return [(0.5, midpoint, None), (0.75, reserve, None)]
+
             if camera_motion is not None:
                 motion_pixels, response = camera_motion
                 self._last_global_motion_pixels = motion_pixels
@@ -1055,15 +1336,18 @@ class AsyncFramePipeline:
                         if regional_result is not None
                         else None
                     )
-                    if is_buffered_reserve and regional_result is not None:
+                    if is_buffered_reserve:
                         # The reserve is a new full-frame blend. Do not copy the
                         # midpoint's interpolation provenance onto different pixels.
-                        regional_provenance = np.full_like(
-                            regional_result.provenance,
-                            int(RegionProvenance.RESERVE_BLEND),
+                        regional_provenance = None
+                        reserve_shape = getattr(generated_image, "shape", ())
+                        reserve_pixels = (
+                            int(reserve_shape[0]) * int(reserve_shape[1])
+                            if len(reserve_shape) >= 2
+                            else 1
                         )
                         regional_provenance_counts = {
-                            "reserve_blend": int(regional_provenance.size)
+                            "reserve_blend": reserve_pixels
                         }
                         regional_admission_reason = "buffered_reserve_blend"
                     results.append(

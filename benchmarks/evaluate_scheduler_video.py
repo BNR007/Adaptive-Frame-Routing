@@ -254,14 +254,16 @@ def run_condition(
                 for result in batch
             ):
                 if not decision.present:
+                    pipeline.discard_refinement(decision.frame.payload)
                     continue
+                resolved = pipeline.resolve_refinement(decision.frame.payload)
                 if args.submit_overhead_ms > 0:
                     time.sleep(args.submit_overhead_ms / 1000.0)
                 presented_kinds.append(decision.frame.frame_kind)
                 presentation_times.append(time.perf_counter())
                 sequence_ids.append(decision.frame.source_sequence_id)
                 generation_positions.append(
-                    float(getattr(decision.frame.payload, "generation_position", 1.0))
+                    float(getattr(resolved, "generation_position", 1.0))
                 )
                 frame_ages_ms.append(
                     (presentation_times[-1] - decision.frame.captured_at) * 1000.0
@@ -337,6 +339,12 @@ def run_condition(
         "input_queue_replacements": pipeline.input_replacements,
         "output_queue_replacements": pipeline.result_replacements,
         "pipeline_generated_drops": pipeline.dropped_generated_frames,
+        "neural_refinements_submitted": pipeline.refinement_submitted,
+        "neural_refinements_ready": pipeline.refinement_completed_on_time,
+        "neural_refinements_applied": pipeline.refinement_applied,
+        "neural_fallbacks_presented": pipeline.refinement_fallback_presented,
+        "neural_late_drops": pipeline.refinement_late_drops,
+        "neural_job_replacements": pipeline.refinement_job_replacements,
         "stale_reserved_batches": pipeline.stale_reserved_batches,
         "max_output_queue_frames": max_output_queue,
         "playout_optional_drops": (

@@ -78,6 +78,12 @@ FRAME_FIELDS = (
     "playout_optional_drops",
     "playout_midpoint_drops",
     "pipeline_generated_drops",
+    "neural_refinements_submitted",
+    "neural_refinements_ready",
+    "neural_refinements_applied",
+    "neural_fallbacks_presented",
+    "neural_late_drops",
+    "neural_job_replacements",
     "generated_deadline_drops",
     "stale_generated_drops",
     "real_deadline_drops",
@@ -646,6 +652,24 @@ class ResearchRunRecorder:
             "playout_startup_waits": int(getattr(playout_queue, "startup_waits", 0)),
             "playout_empty_pops": int(getattr(playout_queue, "empty_pops", 0)),
             "pipeline_generated_drops": int(pipeline.dropped_generated_frames),
+            "neural_refinements_submitted": int(
+                getattr(pipeline, "refinement_submitted", 0)
+            ),
+            "neural_refinements_ready": int(
+                getattr(pipeline, "refinement_completed_on_time", 0)
+            ),
+            "neural_refinements_applied": int(
+                getattr(pipeline, "refinement_applied", 0)
+            ),
+            "neural_fallbacks_presented": int(
+                getattr(pipeline, "refinement_fallback_presented", 0)
+            ),
+            "neural_late_drops": int(
+                getattr(pipeline, "refinement_late_drops", 0)
+            ),
+            "neural_job_replacements": int(
+                getattr(pipeline, "refinement_job_replacements", 0)
+            ),
             "generated_deadline_drops": int(
                 pacing_snapshot.generated_frames_dropped_late
             ),
@@ -746,6 +770,22 @@ class ResearchRunRecorder:
                 "playout_startup_waits": measured_counters["playout_startup_waits"],
                 "playout_empty_pops": measured_counters["playout_empty_pops"],
                 "pipeline_generated_drops": measured_counters["pipeline_generated_drops"],
+                "neural_refinements_submitted": measured_counters[
+                    "neural_refinements_submitted"
+                ],
+                "neural_refinements_ready": measured_counters[
+                    "neural_refinements_ready"
+                ],
+                "neural_refinements_applied": measured_counters[
+                    "neural_refinements_applied"
+                ],
+                "neural_fallbacks_presented": measured_counters[
+                    "neural_fallbacks_presented"
+                ],
+                "neural_late_drops": measured_counters["neural_late_drops"],
+                "neural_job_replacements": measured_counters[
+                    "neural_job_replacements"
+                ],
                 "generated_deadline_drops": measured_counters["generated_deadline_drops"],
                 "stale_generated_drops": measured_counters["stale_generated_drops"],
                 "real_deadline_drops": measured_counters["real_deadline_drops"],

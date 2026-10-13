@@ -1529,8 +1529,11 @@ def run_application(
                 quit_requested = False
                 for decision in pacing_decisions:
                     if not decision.present:
+                        pipeline.discard_refinement(decision.frame.payload)
                         continue
-                    processed_frame = decision.frame.payload
+                    processed_frame = pipeline.resolve_refinement(
+                        decision.frame.payload
+                    )
                     frame = processed_frame.image
                     presented_at = decision.actual_at
                     pacing_snapshot = pacer.snapshot()
@@ -1594,11 +1597,18 @@ def run_application(
                             if buffered_playout is not None:
                                 logger.info(
                                     "Buffered playout: depth %d/%d | optional reserve drops %d | "
-                                    "midpoint drops %d",
+                                    "midpoint drops %d | neural submitted/ready/applied/fallback/late/replaced "
+                                    "%d/%d/%d/%d/%d/%d",
                                     buffered_playout.depth,
                                     buffered_playout.maximum_frames,
                                     buffered_playout.dropped_optional_candidates,
                                     buffered_playout.dropped_midpoint_candidates,
+                                    pipeline.refinement_submitted,
+                                    pipeline.refinement_completed_on_time,
+                                    pipeline.refinement_applied,
+                                    pipeline.refinement_fallback_presented,
+                                    pipeline.refinement_late_drops,
+                                    pipeline.refinement_job_replacements,
                                 )
                             if processed_frame.regional_provenance_counts:
                                 logger.info(
