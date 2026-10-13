@@ -65,9 +65,12 @@ jobs, but the confidence gate accepted and applied none. Smoothness therefore ca
 from buffered cadence and the spatial midpoint fallback. Median frame age was
 approximately 88--92 ms and p95 age was approximately 102--113 ms.
 
-PresentMon reported only 29.92 display events/s for the URFTS process. Until that
-measurement is explained or independently contradicted, the checkpoint supports a
-claim of approximately 60 meaningful software submissions/s, not 60 visibly
-displayed frames/s. The next acceptance gate is at least 50 PresentMon display
-events/s (or an independently measured equivalent) while retaining acceptable
-visual smoothness. Internal counters alone are insufficient.
+The first PresentMon summary incorrectly reported 29.92 display events/s because
+it averaged per-stream frame durations after PresentMon divided the same process's
+events between a DXGI swap-chain category and an `Other` category. Reading the raw
+event timestamps in chronological order gives 59.81 process display events/s,
+with a 16.67 ms median event gap and a 17.14 ms p95 gap. The parser now reports
+timestamp-derived process totals and retains both per-stream breakdowns so this
+case remains auditable. This passes the provisional 50-event/s external telemetry
+gate, although PresentMon remains process-level ETW evidence rather than optical
+proof of unique visible frames.

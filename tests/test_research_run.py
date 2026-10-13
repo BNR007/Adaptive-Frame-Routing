@@ -217,6 +217,59 @@ def test_presentmon_can_be_deferred_until_presenter_exists(
     recorder.close(status="interrupted")
 
 
+def test_presentmon_uses_event_timestamps_across_interleaved_categories(
+    tmp_path: Path,
+) -> None:
+    spec = ResearchRunSpec(
+        root=tmp_path,
+        machine_id="m",
+        application="a",
+        scene_id="s",
+        condition="c",
+        repetition=1,
+    )
+    recorder = ResearchRunRecorder(
+        spec, project_root=tmp_path, resource_probe=FakeProbe()
+    )
+    run_directory = recorder.prepare()
+    recorder._presentmon_path = Path("PresentMon.exe")
+    fields = [
+        "Application",
+        "ProcessID",
+        "SwapChainAddress",
+        "PresentRuntime",
+        "PresentMode",
+        "CPUStartTime",
+        "FrameTime",
+        "DisplayedTime",
+        "DisplayLatency",
+    ]
+    rows = [
+        ["python.exe", "7", "0x1", "DXGI", "Independent Flip", "0.0000", "33.3334", "33.3334", "16.0"],
+        ["python.exe", "7", "0x0", "Other", "Independent Flip", "16.6667", "33.3334", "33.3334", "16.0"],
+        ["python.exe", "7", "0x1", "DXGI", "Independent Flip", "33.3334", "33.3334", "33.3334", "16.0"],
+        ["python.exe", "7", "0x0", "Other", "Independent Flip", "50.0001", "33.3334", "33.3334", "16.0"],
+    ]
+    with (run_directory / "presentmon.csv").open("w", newline="", encoding="utf-8") as target:
+        writer = csv.writer(target)
+        writer.writerow(fields)
+        writer.writerows(rows)
+
+    recorder._finish_presentmon()
+    summary = json.loads(
+        (run_directory / "presentmon_summary.json").read_text(encoding="utf-8")
+    )
+
+    assert summary["observed_displayed_events_per_second"] == pytest.approx(60.0, rel=1e-4)
+    assert summary["displayed_events"]["event_gap_ms"]["median"] == pytest.approx(
+        16.6667, rel=1e-4
+    )
+    assert len(summary["streams"]) == 2
+    assert summary["streams"][0]["displayed"]["events_per_second"] == pytest.approx(
+        30.0, rel=1e-4
+    )
+
+
 def test_output_analyzer_separates_calls_unique_and_meaningful_motion() -> None:
     analyzer = OutputFrameAnalyzer(motion_threshold=1.0)
     black = np.zeros((72, 128, 3), dtype=np.uint8)
