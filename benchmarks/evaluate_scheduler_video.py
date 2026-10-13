@@ -342,6 +342,7 @@ def run_condition(
         "neural_refinements_submitted": pipeline.refinement_submitted,
         "neural_refinements_ready": pipeline.refinement_completed_on_time,
         "neural_refinements_applied": pipeline.refinement_applied,
+        "neural_model_rejections": pipeline.refinement_model_rejections,
         "neural_fallbacks_presented": pipeline.refinement_fallback_presented,
         "neural_late_drops": pipeline.refinement_late_drops,
         "neural_job_replacements": pipeline.refinement_job_replacements,

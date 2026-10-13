@@ -283,6 +283,7 @@ class AsyncFramePipeline:
         self._interpolation_failures = 0
         self._refinement_submitted = 0
         self._refinement_completed_on_time = 0
+        self._refinement_model_rejections = 0
         self._refinement_applied = 0
         self._refinement_fallback_presented = 0
         self._refinement_late_drops = 0
@@ -380,6 +381,11 @@ class AsyncFramePipeline:
     def refinement_completed_on_time(self) -> int:
         with self._state_lock:
             return self._refinement_completed_on_time
+
+    @property
+    def refinement_model_rejections(self) -> int:
+        with self._state_lock:
+            return self._refinement_model_rejections
 
     @property
     def refinement_fallback_presented(self) -> int:
@@ -851,6 +857,16 @@ class AsyncFramePipeline:
             try:
                 image = self._frame_interpolator.interpolate(job.frame_a, job.frame_b)
                 interpolation_ms = (self._clock() - started) * 1000.0
+                inference_ms = getattr(
+                    self._frame_interpolator, "last_inference_ms", None
+                )
+                if inference_ms is None or float(inference_ms) <= 0.0:
+                    # The regional gate returned a spatial/endpoint fallback.
+                    # Do not mislabel that completion as a neural refinement;
+                    # the already-published cadence fallback remains active.
+                    with self._state_lock:
+                        self._refinement_model_rejections += 1
+                    continue
                 regional = getattr(
                     self._frame_interpolator, "last_regional_result", None
                 )

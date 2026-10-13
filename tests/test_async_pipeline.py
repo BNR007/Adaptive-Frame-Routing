@@ -481,6 +481,7 @@ def test_buffered_reserve_uses_one_model_call_for_image_frames():
         active_providers = ("test",)
         last_generation_method = "counting"
         last_total_ms = 0.0
+        last_inference_ms = 1.0
         last_regional_result = None
 
         def __init__(self):
@@ -555,6 +556,7 @@ def test_camera_motion_keeps_midpoint_and_suppresses_time_dilating_reserve():
         produces_intermediate_frame = True
         active_providers = ("test",)
         last_generation_method = "unused"
+        last_inference_ms = 1.0
         last_regional_result = None
 
         def __init__(self):
@@ -625,6 +627,7 @@ def test_slow_neural_refinement_never_blocks_fallback_or_real_endpoint():
         produces_intermediate_frame = True
         active_providers = ("test",)
         last_generation_method = "rife_midpoint"
+        last_inference_ms = 1.0
         last_regional_result = None
 
         def interpolate(self, frame_a, frame_b):
@@ -680,6 +683,7 @@ def test_fast_neural_refinement_atomically_upgrades_pending_midpoint():
         produces_intermediate_frame = True
         active_providers = ("test",)
         last_generation_method = "rife_midpoint"
+        last_inference_ms = 1.0
         last_regional_result = None
 
         def interpolate(self, frame_a, frame_b):
@@ -717,6 +721,51 @@ def test_fast_neural_refinement_atomically_upgrades_pending_midpoint():
         assert np.all(resolved.image == 77)
         assert pipeline.refinement_applied == 1
         assert pipeline.refinement_fallback_presented == 0
+    finally:
+        pipeline.stop()
+
+
+def test_regional_fallback_is_not_counted_or_presented_as_neural_refinement():
+    class RejectedInterpolator:
+        produces_intermediate_frame = True
+        active_providers = ("test",)
+        last_generation_method = "regional_temporal_fallback"
+        last_regional_result = None
+        last_inference_ms = 0.0
+
+        def interpolate(self, frame_a, frame_b):
+            return np.full_like(frame_b, 77)
+
+    class IdentityProcessor:
+        def process(self, frame):
+            return frame
+
+    pipeline = AsyncFramePipeline(
+        IdentityProcessor(),
+        frame_interpolator=RejectedInterpolator(),
+        generated_frames=2,
+        buffered_playout=True,
+    )
+    first = np.zeros((24, 32, 3), dtype=np.uint8)
+    second = np.full_like(first, 100)
+    pipeline.start()
+    try:
+        pipeline.submit(first)
+        assert pipeline.take_latest(timeout=1.0) is not None
+        pipeline.submit(second)
+        batch = pipeline.take_presentation_batch(timeout=1.0)
+        deadline = time.perf_counter() + 1.0
+        while (
+            pipeline.refinement_model_rejections == 0
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.005)
+        resolved = pipeline.resolve_refinement(batch[0])
+        assert resolved.generation_method == "deadline_fallback_midpoint"
+        assert np.all(resolved.image == 50)
+        assert pipeline.refinement_model_rejections == 1
+        assert pipeline.refinement_completed_on_time == 0
+        assert pipeline.refinement_applied == 0
     finally:
         pipeline.stop()
 

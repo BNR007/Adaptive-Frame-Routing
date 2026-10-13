@@ -81,6 +81,7 @@ FRAME_FIELDS = (
     "neural_refinements_submitted",
     "neural_refinements_ready",
     "neural_refinements_applied",
+    "neural_model_rejections",
     "neural_fallbacks_presented",
     "neural_late_drops",
     "neural_job_replacements",
@@ -661,6 +662,9 @@ class ResearchRunRecorder:
             "neural_refinements_applied": int(
                 getattr(pipeline, "refinement_applied", 0)
             ),
+            "neural_model_rejections": int(
+                getattr(pipeline, "refinement_model_rejections", 0)
+            ),
             "neural_fallbacks_presented": int(
                 getattr(pipeline, "refinement_fallback_presented", 0)
             ),
@@ -778,6 +782,9 @@ class ResearchRunRecorder:
                 ],
                 "neural_refinements_applied": measured_counters[
                     "neural_refinements_applied"
+                ],
+                "neural_model_rejections": measured_counters[
+                    "neural_model_rejections"
                 ],
                 "neural_fallbacks_presented": measured_counters[
                     "neural_fallbacks_presented"

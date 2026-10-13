@@ -1597,8 +1597,8 @@ def run_application(
                             if buffered_playout is not None:
                                 logger.info(
                                     "Buffered playout: depth %d/%d | optional reserve drops %d | "
-                                    "midpoint drops %d | neural submitted/ready/applied/fallback/late/replaced "
-                                    "%d/%d/%d/%d/%d/%d",
+                                    "midpoint drops %d | neural submitted/ready/applied/rejected/fallback/late/replaced "
+                                    "%d/%d/%d/%d/%d/%d/%d",
                                     buffered_playout.depth,
                                     buffered_playout.maximum_frames,
                                     buffered_playout.dropped_optional_candidates,
@@ -1606,6 +1606,7 @@ def run_application(
                                     pipeline.refinement_submitted,
                                     pipeline.refinement_completed_on_time,
                                     pipeline.refinement_applied,
+                                    pipeline.refinement_model_rejections,
                                     pipeline.refinement_fallback_presented,
                                     pipeline.refinement_late_drops,
                                     pipeline.refinement_job_replacements,
