@@ -62,7 +62,6 @@ class RegionalConfig:
     minimum_model_tile_fraction: float = 0.10
     minimum_model_confidence_coverage: float = 0.04
     deadline_cost_tolerance: float = 1.10
-    deadline_probe_interval: int = 8
 
     def __post_init__(self) -> None:
         if self.tile_size < 4:
@@ -82,8 +81,6 @@ class RegionalConfig:
                 raise ValueError(f"{name} must be in [0, 1].")
         if not 1.0 <= self.deadline_cost_tolerance <= 2.0:
             raise ValueError("deadline_cost_tolerance must be in [1, 2].")
-        if self.deadline_probe_interval < 1:
-            raise ValueError("deadline_probe_interval must be positive.")
 
 
 @dataclass(slots=True)
@@ -136,7 +133,6 @@ class RegionalTransformController:
         self._pending_confidence: np.ndarray | None = None
         self._pending_shape: tuple[int, int] | None = None
         self._transform_cost_ms: float | None = None
-        self._deadline_rejections_since_probe = 0
         self.last_feedback_error = 0.0
         self.last_admission_reason = "not_evaluated"
 
@@ -148,7 +144,6 @@ class RegionalTransformController:
         self._pending_confidence = None
         self._pending_shape = None
         self._transform_cost_ms = None
-        self._deadline_rejections_since_probe = 0
         self.last_feedback_error = 0.0
         self.last_admission_reason = "not_evaluated"
 
@@ -226,20 +221,11 @@ class RegionalTransformController:
             self.last_admission_reason = "low_confidence_coverage"
             return False
         if not self.can_afford_inference(budget_ms, elapsed_ms=elapsed_ms):
-            self._deadline_rejections_since_probe += 1
-            if (
-                self._deadline_rejections_since_probe
-                < self.config.deadline_probe_interval
-            ):
-                self.last_admission_reason = "deadline"
-                return False
-            # A bounded probe refreshes the learned cost after load or GPU
-            # contention changes. It is attempted only when useful tiles have
-            # already passed the coverage gates above.
-            self._deadline_rejections_since_probe = 0
-            self.last_admission_reason = "model_deadline_probe"
-            return True
-        self._deadline_rejections_since_probe = 0
+            # A synchronous re-probe blocks delivery of the following real
+            # frame and becomes a visible periodic hitch. Keep the stable
+            # fallback until inference can be moved to a non-blocking worker.
+            self.last_admission_reason = "deadline"
+            return False
         self.last_admission_reason = (
             "model_camera_motion"
             if analysis.coherent_camera_motion

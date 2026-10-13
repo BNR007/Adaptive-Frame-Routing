@@ -174,27 +174,6 @@ def test_model_admission_uses_full_transform_cost() -> None:
     assert not controller.should_run_model(analysis, selected, 16.7)
 
 
-def test_deadline_admission_reprobes_and_recovers_from_one_slow_call() -> None:
-    frame = _textured_frame(64, 160)
-    controller = RegionalTransformController(
-        RegionalConfig(deadline_probe_interval=3, cost_alpha=0.2)
-    )
-    analysis = controller.analyze(frame, np.roll(frame, 2, axis=1))
-    analysis.routes.fill(RegionRoute.SMOOTH_MOTION)
-    analysis.confidence.fill(1.0)
-    selected = np.ones(analysis.grid_shape, dtype=bool)
-    controller.record_inference_cost(44.0)
-
-    assert not controller.should_run_model(analysis, selected, 34.0)
-    assert not controller.should_run_model(analysis, selected, 34.0)
-    assert controller.should_run_model(analysis, selected, 34.0)
-    assert controller.last_admission_reason == "model_deadline_probe"
-
-    controller.record_inference_cost(20.0)
-    assert controller.predicted_transform_cost_ms == pytest.approx(32.0)
-    assert controller.should_run_model(analysis, selected, 34.0)
-
-
 def test_confidence_composition_rejects_bad_generated_region() -> None:
     first = _textured_frame()
     second = np.roll(first, 2, axis=1)
