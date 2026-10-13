@@ -260,14 +260,27 @@ def test_presentmon_uses_event_timestamps_across_interleaved_categories(
         (run_directory / "presentmon_summary.json").read_text(encoding="utf-8")
     )
 
-    assert summary["observed_displayed_events_per_second"] == pytest.approx(60.0, rel=1e-4)
-    assert summary["displayed_events"]["event_gap_ms"]["median"] == pytest.approx(
+    assert summary["observed_displayed_events_per_second"] is None
+    assert summary["presenter_attribution"] == "unresolved"
+    assert summary["process_presentation_events"]["events_per_second"] == pytest.approx(60.0, rel=1e-4)
+    assert summary["process_presentation_events"]["event_gap_ms"]["median"] == pytest.approx(
         16.6667, rel=1e-4
     )
     assert len(summary["streams"]) == 2
     assert summary["streams"][0]["displayed"]["events_per_second"] == pytest.approx(
         30.0, rel=1e-4
     )
+
+    recorder.register_presenter(swap_chain_address=1, hwnd=123, process_id=7)
+    recorder._finish_presentmon()
+    selected = recorder._presentmon_summary
+    assert selected["presenter_attribution"] == "exact_swap_chain_match"
+    assert selected["observed_displayed_events_per_second"] == pytest.approx(30.0, rel=1e-4)
+    assert selected["selected_presenter"]["displayed"]["display_interval_ms"]["p95"] == pytest.approx(33.3334)
+
+    recorder.register_presenter(swap_chain_address=2, hwnd=123, process_id=7)
+    recorder._finish_presentmon()
+    assert recorder._presentmon_summary["observed_displayed_events_per_second"] is None
 
 
 def test_output_analyzer_separates_calls_unique_and_meaningful_motion() -> None:

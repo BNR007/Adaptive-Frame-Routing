@@ -156,6 +156,10 @@ class D3D11CpuFramePresenter:
         return self.presenter.hwnd
 
     @property
+    def swap_chain_address(self) -> int:
+        return int(self.presenter._swap_chain.value or 0)
+
+    @property
     def quit_requested(self) -> bool:
         return self.presenter.quit_requested
 

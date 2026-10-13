@@ -514,6 +514,7 @@ class ResearchRunRecorder:
         self._presentmon_process: subprocess.Popen | None = None
         self._presentmon_log = None
         self._presentmon_summary: dict[str, Any] = {}
+        self._presenter_identity: dict[str, Any] | None = None
 
     @property
     def measurement_started_at(self) -> float | None:
@@ -816,6 +817,18 @@ class ResearchRunRecorder:
         self._frame_rows.append(row)
         return True
 
+    def register_presenter(self, *, swap_chain_address: int, hwnd: int, process_id: int | None = None) -> None:
+        """Record the exact native swap chain; never guess from event volume."""
+        self._presenter_identity = {
+            "swap_chain_address": hex(swap_chain_address),
+            "hwnd": hwnd,
+            "process_id": os.getpid() if process_id is None else process_id,
+            "present_runtime": "DXGI",
+        }
+        (self.run_directory / "presenter_identity.json").write_text(
+            json.dumps(self._presenter_identity, indent=2), encoding="utf-8"
+        )
+
     def _start_presentmon(self) -> None:
         if self._presentmon_path is None:
             self._presentmon_summary = {
@@ -925,6 +938,23 @@ class ResearchRunRecorder:
             ]
             display_latency = numeric_column("DisplayLatency", "MsUntilDisplayed")
 
+            def display_timing(event_rows: list[dict[str, str]]) -> dict[str, Any]:
+                durations = []
+                for row in event_rows:
+                    try:
+                        value = float(row.get("DisplayedTime") or row.get("MsBetweenDisplayChange"))
+                        if math.isfinite(value) and value > 0.0:
+                            durations.append(value)
+                    except (TypeError, ValueError):
+                        continue
+                return {
+                    "displayed_samples": len(durations),
+                    "events_per_second": 1000.0 / statistics.fmean(durations) if durations else None,
+                    "display_interval_ms": _distribution(durations),
+                    "gaps_at_least_33ms": sum(value >= 33.0 for value in durations),
+                    "gaps_at_least_50ms": sum(value >= 50.0 for value in durations),
+                }
+
             def event_timing(event_rows: list[dict[str, str]]) -> dict[str, Any]:
                 timestamps: list[float] = []
                 for row in event_rows:
@@ -969,7 +999,6 @@ class ResearchRunRecorder:
                     str(row.get("ProcessID", "")),
                     str(row.get("SwapChainAddress", "")),
                     str(row.get("PresentRuntime", "")),
-                    str(row.get("PresentMode", "")),
                 )
                 stream_rows.setdefault(key, []).append(row)
             streams = []
@@ -980,9 +1009,9 @@ class ResearchRunRecorder:
                     "process_id": key[1],
                     "swap_chain_address": key[2],
                     "present_runtime": key[3],
-                    "present_mode": key[4],
+                    "present_modes": sorted({str(row.get("PresentMode", "")) for row in members}),
                     "presentation": event_timing(members),
-                    "displayed": event_timing(stream_displayed),
+                    "displayed": display_timing(stream_displayed),
                 })
             streams.sort(
                 key=lambda stream: stream["presentation"]["events"], reverse=True
@@ -990,6 +1019,18 @@ class ResearchRunRecorder:
 
             presentation_events = event_timing(rows)
             displayed_events = event_timing(displayed_rows)
+            selected_stream = None
+            identity = self._presenter_identity
+            if identity is not None:
+                for stream in streams:
+                    try:
+                        address_matches = int(stream["swap_chain_address"], 16) == int(identity["swap_chain_address"], 16)
+                    except ValueError:
+                        address_matches = False
+                    if (address_matches and stream["process_id"] == str(identity["process_id"])
+                            and stream["present_runtime"] == "DXGI"):
+                        selected_stream = stream
+                        break
             frame_types = Counter(
                 str(row.get("FrameType", "")).strip()
                 for row in rows
@@ -999,24 +1040,27 @@ class ResearchRunRecorder:
                 "status": "complete" if rows else "no_events",
                 "rows": len(rows),
                 "columns": columns,
-                "observed_presentation_events_per_second": presentation_events[
-                    "events_per_second"
-                ],
-                "presentation_events": presentation_events,
-                "frame_time_ms": _distribution(frame_times),
-                "observed_displayed_events_per_second": (
-                    displayed_events["events_per_second"] if displayed_rows else None
+                "observed_presentation_events_per_second": (
+                    selected_stream["presentation"]["events_per_second"] if selected_stream else None
                 ),
-                "displayed_events": displayed_events,
-                "displayed_time_ms": _distribution(displayed_times),
-                "display_latency_ms": _distribution(display_latency),
+                "process_presentation_events": presentation_events,
+                "process_mixed_frame_time_ms": _distribution(frame_times),
+                "observed_displayed_events_per_second": (
+                    selected_stream["displayed"]["events_per_second"] if selected_stream else None
+                ),
+                "process_displayed_row_cpu_timing": displayed_events,
+                "presenter_identity": identity,
+                "presenter_attribution": "exact_swap_chain_match" if selected_stream else "unresolved",
+                "selected_presenter": selected_stream,
+                "process_mixed_displayed_time_ms": _distribution(displayed_times),
+                "process_mixed_display_latency_ms": _distribution(display_latency),
                 "frame_types": dict(sorted(frame_types.items())),
                 "streams": streams,
                 "scope": (
-                    "Process-wide PresentMon event timestamps attributed to URFTS. "
-                    "Per-stream results are included because one process can own multiple "
-                    "presentation surfaces or ETW categories. Displayed events are stronger "
-                    "evidence than URFTS calls but are not an optical input-to-photon measurement."
+                    "Headline rates require an exact registered presenter swap-chain match. "
+                    "Display cadence uses per-stream DisplayedTime, not CPUStartTime. "
+                    "Process totals are diagnostic only; unrelated streams are never combined "
+                    "as output FPS. ETW timing does not establish unique visible content or optical input latency."
                 ),
             })
             (self.run_directory / "presentmon_summary.json").write_text(

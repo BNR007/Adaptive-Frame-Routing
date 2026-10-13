@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import logging
 import math
 import platform
@@ -1724,6 +1725,15 @@ def run_application(
                             )
                         preview_initialized = True
                         if research_recorder is not None:
+                            research_recorder.register_presenter(
+                                swap_chain_address=native_presenter.swap_chain_address,
+                                hwnd=native_presenter.hwnd,
+                            )
+                            logger.info(
+                                "Research presenter identity: PID %d, HWND %d, DXGI swap chain %s",
+                                os.getpid(), native_presenter.hwnd,
+                                hex(native_presenter.swap_chain_address),
+                            )
                             research_recorder.start_presentmon()
                     if use_native_presenter:
                         native_presenter.present_bgr(frame)
@@ -1807,7 +1817,20 @@ def run_application(
                 )
                 effective = research_summary.get("effective_output", {})
                 presentmon = research_summary.get("presentmon", {})
+                selected_presenter = presentmon.get("selected_presenter") or {}
+                presenter_display = selected_presenter.get("displayed", {})
+                display_intervals = presenter_display.get("display_interval_ms", {})
                 logger.info("Research results saved to %s", research_recorder.run_directory)
+                logger.info(
+                    "PresentMon presenter attribution=%s, swap chain=%s; display interval "
+                    "p95=%s ms, p99=%s ms; gaps >=33 ms=%s, >=50 ms=%s",
+                    presentmon.get("presenter_attribution", "unresolved"),
+                    selected_presenter.get("swap_chain_address", "unresolved"),
+                    display_intervals.get("p95", "unavailable"),
+                    display_intervals.get("p99", "unavailable"),
+                    presenter_display.get("gaps_at_least_33ms", "unavailable"),
+                    presenter_display.get("gaps_at_least_50ms", "unavailable"),
+                )
                 logger.info(
                     "Research result: preview calls %.2f/s, unique %.2f/s, "
                     "meaningful %.2f/s; PresentMon status=%s, display events=%s/s",

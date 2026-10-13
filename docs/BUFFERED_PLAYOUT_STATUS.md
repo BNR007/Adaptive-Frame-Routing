@@ -65,12 +65,17 @@ jobs, but the confidence gate accepted and applied none. Smoothness therefore ca
 from buffered cadence and the spatial midpoint fallback. Median frame age was
 approximately 88--92 ms and p95 age was approximately 102--113 ms.
 
-The first PresentMon summary incorrectly reported 29.92 display events/s because
-it averaged per-stream frame durations after PresentMon divided the same process's
-events between a DXGI swap-chain category and an `Other` category. Reading the raw
-event timestamps in chronological order gives 59.81 process display events/s,
-with a 16.67 ms median event gap and a 17.14 ms p95 gap. The parser now reports
-timestamp-derived process totals and retains both per-stream breakdowns so this
-case remains auditable. This passes the provisional 50-event/s external telemetry
-gate, although PresentMon remains process-level ETW evidence rather than optical
-proof of unique visible frames.
+The initial PresentMon summary pooled different streams and reported 29.92/s.
+The subsequent 59.81/s value pooled CPU event timestamps and also cannot establish
+fullscreen display cadence. The CSV contains a nonzero DXGI stream near 39.77/s
+and an unidentified Other/0x0 stream near 20.08/s; their relationship is unresolved.
+Neither combined value passes the 50-visible-frame/s gate.
+
+The measurement-only correction records the native presenter PID, HWND and COM
+swap-chain address in presenter_identity.json. Headline rates require an exact
+PID/address/DXGI match. Display cadence uses that stream's positive DisplayedTime
+durations; CPU event gaps and process totals remain explicitly diagnostic. If ETW
+does not report the registered address, attribution remains unresolved. Mode
+changes within the same swap chain do not split the measurement. The original
+test_run_12 artifacts are preserved; historical reanalysis cannot establish exact
+presenter identity because it was not recorded at runtime.
