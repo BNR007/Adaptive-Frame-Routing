@@ -51,3 +51,23 @@ the existing `IRIS Research 720p30` profile with `IRIS Buffered Playout
 720p30`, using the same scene and OBS marker analysis. Keep the buffered method
 only if it materially reduces 33.3/50 ms visible gaps without unacceptable
 latency, time-warp, ghosting, or HUD damage.
+
+## 2026-10-13 live checkpoint
+
+A 60 Hz Subnautica: Below Zero run using the buffered profile was subjectively
+reported as "pretty smooth." The source remained near 30 FPS while the scheduler
+released about 60 frames/s. The completed research summary reported 59.90 preview
+calls/s, 59.93 exact-unique submissions/s, and 59.60 meaningfully different
+submissions/s. Scheduler p95 gaps were approximately 17.5--17.8 ms after startup.
+
+This run did not validate neural-frame quality: the neural worker submitted 1,528
+jobs, but the confidence gate accepted and applied none. Smoothness therefore came
+from buffered cadence and the spatial midpoint fallback. Median frame age was
+approximately 88--92 ms and p95 age was approximately 102--113 ms.
+
+PresentMon reported only 29.92 display events/s for the URFTS process. Until that
+measurement is explained or independently contradicted, the checkpoint supports a
+claim of approximately 60 meaningful software submissions/s, not 60 visibly
+displayed frames/s. The next acceptance gate is at least 50 PresentMon display
+events/s (or an independently measured equivalent) while retaining acceptable
+visual smoothness. Internal counters alone are insufficient.
