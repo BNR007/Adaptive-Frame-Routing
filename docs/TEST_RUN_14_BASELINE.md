@@ -30,8 +30,9 @@ Run `Setup GUI.cmd`, then `Start GUI.cmd`. Select **IRIS Buffered Playout
 | Research warmup / measurement | 10 seconds / 30 seconds |
 | Visual marker | enabled |
 
-The GUI preset defaults to CPU inference. Change it to DirectML to match the
-original provider. The original machine used device index 1; do not assume the
+The buffered GUI preset now defaults to DirectML and the settings above. It
+retains an existing local adapter selection, or defaults to index 0 for a fresh
+install. The original machine used device index 1; do not assume the
 friend's device 1 is the same GPU. If CPU is required, record it as a different
 hardware/provider condition rather than an identical reproduction.
 

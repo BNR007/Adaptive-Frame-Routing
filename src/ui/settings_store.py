@@ -119,11 +119,35 @@ def _ensure_iris_profile(settings: GuiSettings) -> GuiSettings:
     if IRIS_BUFFERED_PROFILE not in settings.profiles:
         settings.profiles.append(IRIS_BUFFERED_PROFILE)
     buffered = dict(settings.profile_settings[IRIS_RESEARCH_PROFILE])
+    previous_buffered = settings.profile_settings.get(IRIS_BUFFERED_PROFILE, {})
     buffered.update(
         {
+            "provider": "directml",
+            # Adapter numbering is machine-specific; retain an explicit local
+            # selection instead of copying the author's device 1 to everyone.
+            "rife_device_id": previous_buffered.get("rife_device_id", 0),
+            "upscaling_mode": "shader",
+            "upscaling_method": "bicubic",
+            "frame_generation": "rife",
+            "rife_model_path": str(resource_path("models", "RIFE_v4.25_lite.onnx")),
+            "performance_preset": "performance",
+            "target_fps": "60",
+            "custom_fps": 60.0,
+            "frame_pacing": "fixed",
+            "ai_input_width": 160,
+            "ai_input_height": 90,
             "generated_frames": 2,
             "buffered_playout": True,
             "max_frame_latency_ms": 130.0,
+            "queue_depth": 2,
+            "regional_transform": True,
+            "regional_budget_ms": 34.0,
+            "output_refinement": 0.0,
+            "temporal_stabilization": True,
+            "capture_backend": "wgc",
+            "pipeline": "cpu",
+            "research_warmup_seconds": 10.0,
+            "research_duration_seconds": 30.0,
             "research_condition": "adaptive_routing_buffered",
         }
     )

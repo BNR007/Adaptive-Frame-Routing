@@ -198,9 +198,28 @@ def test_iris_buffered_profile_enables_bounded_extra_candidates(
     assert configuration.generated_frames == 2
     assert configuration.buffered_playout is True
     assert configuration.max_frame_latency_ms == pytest.approx(130.0)
+    assert configuration.provider == "directml"
+    assert configuration.frame_pacing == "fixed"
+    assert configuration.ai_input_width == 160
+    assert configuration.ai_input_height == 90
+    assert configuration.research_warmup_seconds == pytest.approx(10.0)
+    assert configuration.research_duration_seconds == pytest.approx(30.0)
     args = configuration.to_engine_args()
     assert args.buffered_playout is True
     window.close()
+
+
+def test_buffered_profile_refresh_preserves_local_adapter(tmp_path: Path) -> None:
+    store = SettingsStore(tmp_path / "buffered.json")
+    settings = store.load()
+    settings.profile_settings[IRIS_BUFFERED_PROFILE].update(
+        {"provider": "cpu", "rife_device_id": 1, "frame_pacing": "auto"}
+    )
+    store.save(settings)
+    buffered = store.load().profile_settings[IRIS_BUFFERED_PROFILE]
+    assert buffered["provider"] == "directml"
+    assert buffered["rife_device_id"] == 1
+    assert buffered["frame_pacing"] == "fixed"
 
 
 def test_workspace_cards_keep_content_height_in_two_column_layout(
