@@ -64,6 +64,49 @@ def test_hud_like_region_is_kept_out_of_temporal_route() -> None:
     assert np.count_nonzero(analysis.routes == RegionRoute.HUD_TEXT) > 0
 
 
+def test_coherent_camera_pan_is_admitted_to_temporal_model() -> None:
+    first = _textured_frame(128, 192)
+    transform = np.float32([[1, 0, 6], [0, 1, 2]])
+    second = cv2.warpAffine(
+        first,
+        transform,
+        (first.shape[1], first.shape[0]),
+        borderMode=cv2.BORDER_REFLECT,
+    )
+    controller = RegionalTransformController(
+        RegionalConfig(tile_size=16, analysis_scale=2)
+    )
+
+    analysis = controller.analyze(first, second)
+    selected = controller.allocate(
+        analysis, budget_ms=34.0, elapsed_ms=analysis.analysis_ms
+    )
+
+    assert analysis.coherent_camera_motion
+    assert analysis.global_motion_pixels >= 0.5
+    assert analysis.global_motion_response >= 0.15
+    assert np.count_nonzero(analysis.routes == RegionRoute.SMOOTH_MOTION) > 0
+    assert controller.should_run_model(
+        analysis,
+        selected,
+        34.0,
+        elapsed_ms=analysis.analysis_ms,
+    )
+    assert controller.last_admission_reason == "model_camera_motion"
+
+
+def test_moving_high_frequency_scene_is_not_mislabeled_as_hud() -> None:
+    first = _textured_frame(128, 192)
+    second = np.roll(first, 8, axis=1)
+    controller = RegionalTransformController(
+        RegionalConfig(tile_size=16, analysis_scale=2)
+    )
+
+    analysis = controller.analyze(first, second)
+
+    assert np.count_nonzero(analysis.routes == RegionRoute.HUD_TEXT) == 0
+
+
 def test_deadline_allocator_uses_highest_utility_tiles_first() -> None:
     frame = _textured_frame(64, 128)
     controller = RegionalTransformController(
@@ -129,6 +172,27 @@ def test_model_admission_uses_full_transform_cost() -> None:
 
     assert controller.predicted_transform_cost_ms == pytest.approx(28.0)
     assert not controller.should_run_model(analysis, selected, 16.7)
+
+
+def test_deadline_admission_reprobes_and_recovers_from_one_slow_call() -> None:
+    frame = _textured_frame(64, 160)
+    controller = RegionalTransformController(
+        RegionalConfig(deadline_probe_interval=3, cost_alpha=0.2)
+    )
+    analysis = controller.analyze(frame, np.roll(frame, 2, axis=1))
+    analysis.routes.fill(RegionRoute.SMOOTH_MOTION)
+    analysis.confidence.fill(1.0)
+    selected = np.ones(analysis.grid_shape, dtype=bool)
+    controller.record_inference_cost(44.0)
+
+    assert not controller.should_run_model(analysis, selected, 34.0)
+    assert not controller.should_run_model(analysis, selected, 34.0)
+    assert controller.should_run_model(analysis, selected, 34.0)
+    assert controller.last_admission_reason == "model_deadline_probe"
+
+    controller.record_inference_cost(20.0)
+    assert controller.predicted_transform_cost_ms == pytest.approx(32.0)
+    assert controller.should_run_model(analysis, selected, 34.0)
 
 
 def test_confidence_composition_rejects_bad_generated_region() -> None:

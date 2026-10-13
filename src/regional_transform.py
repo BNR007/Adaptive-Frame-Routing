@@ -61,6 +61,8 @@ class RegionalConfig:
     hysteresis: float = 0.08
     minimum_model_tile_fraction: float = 0.10
     minimum_model_confidence_coverage: float = 0.04
+    deadline_cost_tolerance: float = 1.10
+    deadline_probe_interval: int = 8
 
     def __post_init__(self) -> None:
         if self.tile_size < 4:
@@ -78,6 +80,10 @@ class RegionalConfig:
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1].")
+        if not 1.0 <= self.deadline_cost_tolerance <= 2.0:
+            raise ValueError("deadline_cost_tolerance must be in [1, 2].")
+        if self.deadline_probe_interval < 1:
+            raise ValueError("deadline_probe_interval must be positive.")
 
 
 @dataclass(slots=True)
@@ -90,6 +96,9 @@ class RegionalAnalysis:
     motion_consistency: np.ndarray
     text_likelihood: np.ndarray
     scene_cut: bool
+    coherent_camera_motion: bool
+    global_motion_pixels: float
+    global_motion_response: float
     analysis_ms: float
     source_shape: tuple[int, int]
     analysis_shape: tuple[int, int]
@@ -127,6 +136,7 @@ class RegionalTransformController:
         self._pending_confidence: np.ndarray | None = None
         self._pending_shape: tuple[int, int] | None = None
         self._transform_cost_ms: float | None = None
+        self._deadline_rejections_since_probe = 0
         self.last_feedback_error = 0.0
         self.last_admission_reason = "not_evaluated"
 
@@ -138,6 +148,7 @@ class RegionalTransformController:
         self._pending_confidence = None
         self._pending_shape = None
         self._transform_cost_ms = None
+        self._deadline_rejections_since_probe = 0
         self.last_feedback_error = 0.0
         self.last_admission_reason = "not_evaluated"
 
@@ -159,7 +170,9 @@ class RegionalTransformController:
         if budget_ms is None or self._transform_cost_ms is None:
             return True
         remaining = max(0.0, float(budget_ms) - max(0.0, float(elapsed_ms)))
-        return self._transform_cost_ms <= remaining
+        return self._transform_cost_ms <= (
+            remaining * self.config.deadline_cost_tolerance
+        )
 
     def record_inference_cost(self, measured_ms: float) -> None:
         """Update the whole-transform cost prediction.
@@ -175,7 +188,13 @@ class RegionalTransformController:
         if self._transform_cost_ms is None:
             self._transform_cost_ms = float(measured_ms)
             return
+        # Recover quickly from an isolated slow call. Without this asymmetric
+        # update, one DirectML spike could leave the model permanently locked
+        # out because no later inference would be admitted to correct the
+        # estimate.
         alpha = self.config.cost_alpha
+        if float(measured_ms) < self._transform_cost_ms:
+            alpha = max(alpha, 0.5)
         self._transform_cost_ms = (
             self._transform_cost_ms * (1.0 - alpha) + float(measured_ms) * alpha
         )
@@ -207,9 +226,25 @@ class RegionalTransformController:
             self.last_admission_reason = "low_confidence_coverage"
             return False
         if not self.can_afford_inference(budget_ms, elapsed_ms=elapsed_ms):
-            self.last_admission_reason = "deadline"
-            return False
-        self.last_admission_reason = "model"
+            self._deadline_rejections_since_probe += 1
+            if (
+                self._deadline_rejections_since_probe
+                < self.config.deadline_probe_interval
+            ):
+                self.last_admission_reason = "deadline"
+                return False
+            # A bounded probe refreshes the learned cost after load or GPU
+            # contention changes. It is attempted only when useful tiles have
+            # already passed the coverage gates above.
+            self._deadline_rejections_since_probe = 0
+            self.last_admission_reason = "model_deadline_probe"
+            return True
+        self._deadline_rejections_since_probe = 0
+        self.last_admission_reason = (
+            "model_camera_motion"
+            if analysis.coherent_camera_motion
+            else "model"
+        )
         return True
 
     @staticmethod
@@ -264,6 +299,38 @@ class RegionalTransformController:
             self._cost_ms = np.ones(shape, dtype=np.float32)
             self._previous_routes = None
 
+    @staticmethod
+    def _coherent_camera_motion(
+        gray_a: np.ndarray,
+        gray_b: np.ndarray,
+    ) -> tuple[bool, float, float]:
+        """Identify a broad, coherent image translation.
+
+        Ordinary per-pixel differences make a camera pan look unreliable:
+        almost every textured tile changes at once.  Phase correlation gives
+        the router a cheap global-motion signal so those tiles can be sent to
+        the temporal model instead of being rejected before inference.  The
+        confidence compositor still protects disocclusions and inconsistent
+        objects after the model runs.
+        """
+
+        difference = cv2.absdiff(gray_a, gray_b)
+        active_fraction = float(np.mean(difference >= 8))
+        if active_fraction < 0.06:
+            return False, 0.0, 0.0
+        height, width = gray_a.shape
+        window = cv2.createHanningWindow((width, height), cv2.CV_32F)
+        (shift_x, shift_y), response = cv2.phaseCorrelate(
+            gray_a.astype(np.float32),
+            gray_b.astype(np.float32),
+            window,
+        )
+        if not np.isfinite((shift_x, shift_y, response)).all():
+            return False, 0.0, 0.0
+        motion_pixels = float(np.hypot(shift_x, shift_y))
+        coherent = bool(response >= 0.15 and motion_pixels >= 0.5)
+        return coherent, motion_pixels, float(response)
+
     def analyze(self, frame_a: np.ndarray, frame_b: np.ndarray) -> RegionalAnalysis:
         """Calculate inexpensive features and choose an initial route per tile."""
 
@@ -272,6 +339,16 @@ class RegionalTransformController:
         first, second = self._analysis_pair(frame_a, frame_b)
         gray_a = cv2.cvtColor(first, cv2.COLOR_BGR2GRAY)
         gray_b = cv2.cvtColor(second, cv2.COLOR_BGR2GRAY)
+        # Use the model-resolution inputs for global motion.  The tile feature
+        # pair below is intentionally smaller and is too coarse for a stable
+        # phase-correlation estimate during a pan.
+        global_gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
+        global_gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+        (
+            coherent_camera_motion,
+            global_motion_pixels,
+            global_motion_response,
+        ) = self._coherent_camera_motion(global_gray_a, global_gray_b)
         difference = cv2.absdiff(gray_a, gray_b)
         tile = max(4, self.config.tile_size // self.config.analysis_scale)
 
@@ -313,13 +390,7 @@ class RegionalTransformController:
             text = (
                 (text_likelihood >= self.config.text_threshold)
                 & (edge_density >= self.config.detail_threshold)
-                & (
-                    (motion <= self.config.static_motion_threshold * 1.6)
-                    | (
-                        text_likelihood
-                        >= max(0.45, self.config.text_threshold * 3.0)
-                    )
-                )
+                & (motion <= self.config.static_motion_threshold * 1.6)
             )
             static = motion <= self.config.static_motion_threshold
             smooth = (
@@ -334,6 +405,16 @@ class RegionalTransformController:
             routes[static & detailed] = RegionRoute.STATIC_DETAIL
             routes[smooth] = RegionRoute.SMOOTH_MOTION
             routes[unreliable] = RegionRoute.UNRELIABLE_MOTION
+            # During coherent camera motion, large pixel differences do not
+            # mean the temporal model is unreliable. Re-admit changing,
+            # non-HUD tiles and let the post-inference residual/confidence gate
+            # reject local occlusions or independently moving objects.
+            if coherent_camera_motion:
+                camera_candidates = (
+                    (motion > self.config.static_motion_threshold)
+                    & ~text
+                )
+                routes[camera_candidates] = RegionRoute.SMOOTH_MOTION
             routes[text] = RegionRoute.HUD_TEXT
 
         self._ensure_state(routes.shape)
@@ -375,6 +456,9 @@ class RegionalTransformController:
             motion_consistency=motion_consistency,
             text_likelihood=text_likelihood,
             scene_cut=scene_cut,
+            coherent_camera_motion=coherent_camera_motion,
+            global_motion_pixels=global_motion_pixels,
+            global_motion_response=global_motion_response,
             analysis_ms=analysis_ms,
             source_shape=frame_a.shape[:2],
             analysis_shape=first.shape[:2],
